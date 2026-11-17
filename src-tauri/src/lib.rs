@@ -1,4 +1,7 @@
+pub mod monitor;
+
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tauri::{
     menu::{MenuBuilder, MenuItem, PredefinedMenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
@@ -21,6 +24,14 @@ pub struct AppState {
 #[tauri::command]
 fn get_session_status(state: State<'_, AppState>) -> SessionState {
     state.session.lock().unwrap().clone()
+}
+
+#[tauri::command]
+fn get_live_os_info() -> (monitor::ActiveWindowInfo, monitor::MediaStatus) {
+    (
+        monitor::get_active_window_info(),
+        monitor::get_current_media_status(),
+    )
 }
 
 #[tauri::command]
@@ -97,17 +108,56 @@ pub fn run() {
         session: Arc::new(Mutex::new(SessionState::default())),
     };
 
+    let session_ref = app_state.session.clone();
+
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .manage(app_state)
         .invoke_handler(tauri::generate_handler![
             get_session_status,
+            get_live_os_info,
             start_focus_session,
             end_focus_session,
             trigger_barrier,
             dismiss_barrier,
         ])
-        .setup(|app| {
+        .setup(move |app| {
+            // Spawn Background OS Monitor Thread
+            let monitor_handle = app.handle().clone();
+            let monitor_session = session_ref.clone();
+
+            std::thread::spawn(move || {
+                let mut rules = monitor::RulesEngine::new();
+                loop {
+                    std::thread::sleep(Duration::from_millis(500));
+
+                    let is_focus_active = {
+                        let lock = monitor_session.lock().unwrap();
+                        lock.is_focus_active
+                    };
+
+                    let window = monitor::get_active_window_info();
+                    let media = monitor::get_current_media_status();
+
+                    let eval = rules.evaluate(is_focus_active, &window, &media);
+                    if let monitor::EvaluationResult::TriggerBarrier { reason } = eval {
+                        let mut session = monitor_session.lock().unwrap();
+                        if session.is_focus_active && !session.is_overlay_visible {
+                            session.is_overlay_visible = true;
+                            let snapshot = session.clone();
+                            drop(session);
+
+                            if let Some(overlay) = monitor_handle.get_webview_window("overlay") {
+                                let _ = overlay.show();
+                                let _ = overlay.set_focus();
+                            }
+                            let _ = monitor_handle.emit("session-changed", &snapshot);
+                            let _ = monitor_handle.emit("barrier-triggered", reason);
+                        }
+                    }
+                }
+            });
+
             // Build Tray Menu Items
             let header_item = MenuItem::with_id(
                 app,
