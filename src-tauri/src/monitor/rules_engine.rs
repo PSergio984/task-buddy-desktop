@@ -1,10 +1,11 @@
+use std::collections::HashSet;
 use std::time::{Duration, Instant};
 use super::media_hook::MediaStatus;
 use super::window_hook::ActiveWindowInfo;
 
 const CODING_GRACE_BUFFER_SECS: u64 = 30;
 
-pub const WHITELISTED_DEV_APPS: &[&str] = &[
+pub const DEFAULT_WHITELIST: &[&str] = &[
     "code.exe",
     "cursor.exe",
     "windowsterminal.exe",
@@ -16,7 +17,7 @@ pub const WHITELISTED_DEV_APPS: &[&str] = &[
     "pycharm64.exe",
 ];
 
-pub const BLACKLISTED_APPS: &[&str] = &[
+pub const DEFAULT_BLACKLIST: &[&str] = &[
     "steam.exe",
     "discord.exe",
     "spotify.exe",
@@ -33,6 +34,8 @@ pub enum EvaluationResult {
 pub struct RulesEngine {
     pub pause_started_at: Option<Instant>,
     pub was_playing: bool,
+    pub custom_whitelist: HashSet<String>,
+    pub custom_blacklist: HashSet<String>,
 }
 
 impl Default for RulesEngine {
@@ -40,6 +43,8 @@ impl Default for RulesEngine {
         Self {
             pause_started_at: None,
             was_playing: false,
+            custom_whitelist: HashSet::new(),
+            custom_blacklist: HashSet::new(),
         }
     }
 }
@@ -47,6 +52,24 @@ impl Default for RulesEngine {
 impl RulesEngine {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn update_rules(&mut self, rules: &[crate::db::ProcessRule]) {
+        self.custom_whitelist.clear();
+        self.custom_blacklist.clear();
+
+        for r in rules {
+            let name = r.process_name.to_lowercase();
+            match r.category.as_str() {
+                "whitelist" => {
+                    self.custom_whitelist.insert(name);
+                }
+                "blacklist" => {
+                    self.custom_blacklist.insert(name);
+                }
+                _ => {}
+            }
+        }
     }
 
     pub fn evaluate(
@@ -67,14 +90,14 @@ impl RulesEngine {
         let proc = window.process_name.to_lowercase();
 
         // 1. Blacklisted apps trigger immediate barrier
-        if BLACKLISTED_APPS.contains(&proc.as_str()) {
+        if DEFAULT_BLACKLIST.contains(&proc.as_str()) || self.custom_blacklist.contains(&proc) {
             return EvaluationResult::TriggerBarrier {
                 reason: "Blacklisted distraction application active",
             };
         }
 
         // 2. Whitelisted development tools are always allowed
-        if WHITELISTED_DEV_APPS.contains(&proc.as_str()) {
+        if DEFAULT_WHITELIST.contains(&proc.as_str()) || self.custom_whitelist.contains(&proc) {
             // User is actively in IDE or terminal, keep them in the zone
             return EvaluationResult::Allow {
                 reason: "Active development tool whitelisted",

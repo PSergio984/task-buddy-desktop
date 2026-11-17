@@ -1,5 +1,8 @@
+pub mod db;
 pub mod monitor;
+pub mod sync;
 
+use chrono::Utc;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tauri::{
@@ -10,15 +13,20 @@ use tauri::{
 
 #[derive(Default, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SessionState {
+    pub session_id: String,
+    pub remote_session_id: Option<i64>,
     pub is_focus_active: bool,
     pub task_title: String,
     pub duration_minutes: u32,
     pub elapsed_seconds: u32,
     pub is_overlay_visible: bool,
+    pub backend_token: Option<String>,
 }
 
 pub struct AppState {
     pub session: Arc<Mutex<SessionState>>,
+    pub db: db::Database,
+    pub sync_client: sync::BackendSyncClient,
 }
 
 #[tauri::command]
@@ -35,22 +43,88 @@ fn get_live_os_info() -> (monitor::ActiveWindowInfo, monitor::MediaStatus) {
 }
 
 #[tauri::command]
-fn start_focus_session(
+fn get_local_rules(state: State<'_, AppState>) -> Result<Vec<db::ProcessRule>, String> {
+    state.db.get_rules().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn add_local_rule(
+    state: State<'_, AppState>,
+    process_name: String,
+    category: String,
+) -> Result<(), String> {
+    state
+        .db
+        .add_rule(&process_name, &category)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn delete_local_rule(state: State<'_, AppState>, id: i64) -> Result<(), String> {
+    state.db.delete_rule(id).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn get_recent_sessions(
+    state: State<'_, AppState>,
+    limit: u32,
+) -> Result<Vec<db::FocusSessionRecord>, String> {
+    state.db.get_recent_sessions(limit).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn start_focus_session(
     app: AppHandle,
     state: State<'_, AppState>,
     task_title: String,
     duration_minutes: u32,
+    token: Option<String>,
 ) -> Result<SessionState, String> {
-    let mut session = state.session.lock().unwrap();
-    session.is_focus_active = true;
-    session.task_title = if task_title.trim().is_empty() {
+    let session_uuid = format!("sess_{}", Utc::now().timestamp_millis());
+    let clean_title = if task_title.trim().is_empty() {
         "Deep Work".to_string()
     } else {
-        task_title
+        task_title.trim().to_string()
     };
+
+    // Attempt remote backend session creation if token is provided
+    let mut remote_id = None;
+    if let Some(ref auth_token) = token {
+        if !auth_token.is_empty() {
+            if let Ok(id) = state
+                .sync_client
+                .start_remote_session(auth_token, duration_minutes, &clean_title)
+                .await
+            {
+                remote_id = Some(id);
+            }
+        }
+    }
+
+    // Record in local SQLite
+    let record = db::FocusSessionRecord {
+        id: session_uuid.clone(),
+        task_id: None,
+        task_title: clean_title.clone(),
+        started_at: Utc::now().to_rfc3339(),
+        ended_at: None,
+        target_duration_minutes: duration_minutes,
+        actual_duration_seconds: 0,
+        status: "running".to_string(),
+        diversion_count: 0,
+        synced_to_backend: remote_id.is_some(),
+    };
+    let _ = state.db.insert_session(&record);
+
+    let mut session = state.session.lock().unwrap();
+    session.session_id = session_uuid;
+    session.remote_session_id = remote_id;
+    session.is_focus_active = true;
+    session.task_title = clean_title;
     session.duration_minutes = duration_minutes;
     session.elapsed_seconds = 0;
     session.is_overlay_visible = false;
+    session.backend_token = token;
 
     let snapshot = session.clone();
     let _ = app.emit("session-changed", &snapshot);
@@ -58,10 +132,32 @@ fn start_focus_session(
 }
 
 #[tauri::command]
-fn end_focus_session(app: AppHandle, state: State<'_, AppState>) -> Result<SessionState, String> {
+async fn end_focus_session(app: AppHandle, state: State<'_, AppState>) -> Result<SessionState, String> {
     let mut session = state.session.lock().unwrap();
     session.is_focus_active = false;
     session.is_overlay_visible = false;
+
+    let sess_id = session.session_id.clone();
+    let remote_id = session.remote_session_id;
+    let token = session.backend_token.clone();
+    let elapsed = session.elapsed_seconds;
+
+    // Update local SQLite record
+    let _ = state.db.update_session_end(
+        &sess_id,
+        &Utc::now().to_rfc3339(),
+        elapsed,
+        "completed",
+        0,
+    );
+
+    // Stop remote session if connected
+    if let (Some(t), Some(rid)) = (token, remote_id) {
+        let client = state.sync_client.clone();
+        tauri::async_runtime::spawn(async move {
+            let _ = client.stop_remote_session(&t, rid).await;
+        });
+    }
 
     // Ensure overlay is hidden if active
     if let Some(overlay) = app.get_webview_window("overlay") {
@@ -93,6 +189,19 @@ fn dismiss_barrier(app: AppHandle, state: State<'_, AppState>) -> Result<(), Str
     let mut session = state.session.lock().unwrap();
     session.is_overlay_visible = false;
 
+    let sess_id = session.session_id.clone();
+
+    // Log bypass in SQLite
+    let div_record = db::DiversionEventRecord {
+        id: format!("div_{}", Utc::now().timestamp_millis()),
+        session_id: sess_id,
+        timestamp: Utc::now().to_rfc3339(),
+        trigger_type: "manual_bypass".to_string(),
+        detected_title: None,
+        bypassed: true,
+    };
+    let _ = state.db.record_diversion(&div_record);
+
     if let Some(overlay) = app.get_webview_window("overlay") {
         let _ = overlay.hide();
     }
@@ -104,11 +213,17 @@ fn dismiss_barrier(app: AppHandle, state: State<'_, AppState>) -> Result<(), Str
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    let db_instance = db::Database::new("task_buddy_desktop.db").expect("Failed to initialize SQLite database");
+    let sync_client = sync::BackendSyncClient::default();
+
     let app_state = AppState {
         session: Arc::new(Mutex::new(SessionState::default())),
+        db: db_instance.clone(),
+        sync_client,
     };
 
     let session_ref = app_state.session.clone();
+    let db_ref = db_instance.clone();
 
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
@@ -116,20 +231,40 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_session_status,
             get_live_os_info,
+            get_local_rules,
+            add_local_rule,
+            delete_local_rule,
+            get_recent_sessions,
             start_focus_session,
             end_focus_session,
             trigger_barrier,
             dismiss_barrier,
         ])
         .setup(move |app| {
-            // Spawn Background OS Monitor Thread
+            // Spawn Background OS Monitor Thread with dynamic SQLite rules
             let monitor_handle = app.handle().clone();
             let monitor_session = session_ref.clone();
+            let monitor_db = db_ref.clone();
 
             std::thread::spawn(move || {
                 let mut rules = monitor::RulesEngine::new();
+                let mut last_rules_update = std::time::Instant::now();
+
+                // Initial rules load
+                if let Ok(initial_rules) = monitor_db.get_rules() {
+                    rules.update_rules(&initial_rules);
+                }
+
                 loop {
                     std::thread::sleep(Duration::from_millis(500));
+
+                    // Refresh custom rules from SQLite every 5 seconds
+                    if last_rules_update.elapsed() > Duration::from_secs(5) {
+                        if let Ok(updated_rules) = monitor_db.get_rules() {
+                            rules.update_rules(&updated_rules);
+                        }
+                        last_rules_update = std::time::Instant::now();
+                    }
 
                     let is_focus_active = {
                         let lock = monitor_session.lock().unwrap();
@@ -145,7 +280,19 @@ pub fn run() {
                         if session.is_focus_active && !session.is_overlay_visible {
                             session.is_overlay_visible = true;
                             let snapshot = session.clone();
+                            let sess_id = session.session_id.clone();
                             drop(session);
+
+                            // Record diversion event in SQLite
+                            let div = db::DiversionEventRecord {
+                                id: format!("div_{}", Utc::now().timestamp_millis()),
+                                session_id: sess_id,
+                                timestamp: Utc::now().to_rfc3339(),
+                                trigger_type: reason.to_string(),
+                                detected_title: Some(window.title.clone()),
+                                bypassed: false,
+                            };
+                            let _ = monitor_db.record_diversion(&div);
 
                             if let Some(overlay) = monitor_handle.get_webview_window("overlay") {
                                 let _ = overlay.show();
@@ -219,6 +366,7 @@ pub fn run() {
                     "start_25" => {
                         let state = app.state::<AppState>();
                         let mut session = state.session.lock().unwrap();
+                        session.session_id = format!("sess_{}", Utc::now().timestamp_millis());
                         session.is_focus_active = true;
                         session.duration_minutes = 25;
                         session.elapsed_seconds = 0;
@@ -230,6 +378,7 @@ pub fn run() {
                     "start_50" => {
                         let state = app.state::<AppState>();
                         let mut session = state.session.lock().unwrap();
+                        session.session_id = format!("sess_{}", Utc::now().timestamp_millis());
                         session.is_focus_active = true;
                         session.duration_minutes = 50;
                         session.elapsed_seconds = 0;
