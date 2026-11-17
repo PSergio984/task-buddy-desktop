@@ -1,12 +1,23 @@
 import { useEffect, useState, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { ShieldAlert, Clock, ArrowRight } from "lucide-react";
+import { ShieldAlert, Clock, ArrowRight, ShieldCheck, Flame } from "lucide-react";
 
 const REQUIRED_HOLD_MS = 6000;
+
+interface DiversionPenaltyResult {
+  applied: boolean;
+  base_damage: number;
+  hp_lost: number;
+  damage_mitigated: number;
+  current_hp: number;
+  died: boolean;
+}
 
 export const OverlayBarrierView: React.FC = () => {
   const [holdProgress, setHoldProgress] = useState(0); // 0 to 1
   const [isHolding, setIsHolding] = useState(false);
+  const [shieldAvailable, setShieldAvailable] = useState(() => !sessionStorage.getItem("shield_spent"));
+  const [penaltyFeedback, setPenaltyFeedback] = useState<string | null>(null);
   const holdStartTimeRef = useRef<number | null>(null);
   const animFrameRef = useRef<number | null>(null);
 
@@ -64,14 +75,31 @@ export const OverlayBarrierView: React.FC = () => {
   const completeBypass = async () => {
     cancelHold();
     try {
-      await invoke("dismiss_barrier");
+      const penalty = await invoke<DiversionPenaltyResult | null>("record_barrier_bypass", {
+        reason: "barrier_force_bypass",
+      });
+      if (penalty && penalty.applied) {
+        setPenaltyFeedback(
+          `⚠️ Focus Broken: -${penalty.hp_lost} HP (${penalty.damage_mitigated} HP absorbed by gear)`
+        );
+        setTimeout(() => {
+          invoke("dismiss_barrier").catch(console.error);
+        }, 1200);
+      } else {
+        await invoke("dismiss_barrier");
+      }
     } catch (err) {
-      console.error("Failed to dismiss barrier:", err);
+      console.error("Failed to record bypass penalty:", err);
+      await invoke("dismiss_barrier");
     }
   };
 
   const activate5mAllowance = async () => {
     try {
+      if (shieldAvailable) {
+        sessionStorage.setItem("shield_spent", "true");
+        setShieldAvailable(false);
+      }
       await invoke("dismiss_barrier");
     } catch (err) {
       console.error("Failed to dismiss barrier for allowance:", err);
@@ -96,9 +124,16 @@ export const OverlayBarrierView: React.FC = () => {
         <h1 className="text-3xl font-bold tracking-tight text-white mb-2">
           Pause & Re-Align
         </h1>
-        <p className="text-slate-400 text-sm mb-10 leading-relaxed">
+        <p className="text-slate-400 text-sm mb-6 leading-relaxed">
           Mindful friction gate engaged. Take a conscious breath before switching contexts or wandering away from your declared work.
         </p>
+
+        {penaltyFeedback && (
+          <div className="w-full mb-6 p-3 rounded-lg bg-red-500/20 border border-red-500/40 text-red-300 text-xs flex items-center justify-center gap-2 animate-bounce">
+            <Flame className="w-4 h-4 text-red-400 shrink-0" />
+            <span>{penaltyFeedback}</span>
+          </div>
+        )}
 
         {/* 6-Second Radial Progress Dial */}
         <div
@@ -152,18 +187,33 @@ export const OverlayBarrierView: React.FC = () => {
         <div className="w-full pt-6 border-t border-slate-800/80 flex items-center justify-between gap-4">
           <div className="text-left">
             <div className="text-xs font-semibold text-slate-300 flex items-center gap-1.5">
-              <Clock className="w-3.5 h-3.5 text-blue-400" />
-              <span>5-Minute Quick Allowance</span>
+              {shieldAvailable ? (
+                <>
+                  <ShieldCheck className="w-3.5 h-3.5 text-emerald-400" />
+                  <span>1x Tactical Shield (0 HP Loss)</span>
+                </>
+              ) : (
+                <>
+                  <Clock className="w-3.5 h-3.5 text-blue-400" />
+                  <span>5-Minute Quick Allowance</span>
+                </>
+              )}
             </div>
             <div className="text-[11px] text-slate-500">
-              Need to reply to a coworker on Messenger?
+              {shieldAvailable
+                ? "Emergency allowance to reply to a message"
+                : "Shield already spent for this session"}
             </div>
           </div>
           <button
             onClick={activate5mAllowance}
-            className="px-3 py-1.5 text-xs font-medium bg-blue-500/10 hover:bg-blue-500/20 text-blue-400 border border-blue-500/30 rounded-lg transition-colors flex items-center gap-1"
+            className={`px-3 py-1.5 text-xs font-medium rounded-lg transition-colors flex items-center gap-1 cursor-pointer ${
+              shieldAvailable
+                ? "bg-emerald-500/10 hover:bg-emerald-500/20 text-emerald-400 border border-emerald-500/30"
+                : "bg-blue-500/10 hover:bg-blue-500/20 text-blue-400 border border-blue-500/30"
+            }`}
           >
-            <span>Activate 5m</span>
+            <span>{shieldAvailable ? "Use Shield" : "Activate 5m"}</span>
             <ArrowRight className="w-3 h-3" />
           </button>
         </div>

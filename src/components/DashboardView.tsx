@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { Play, Square, Shield, Clock, Zap, Laptop, Activity, Music, Plus, Trash2, ListFilter, Cloud, Sparkles } from "lucide-react";
+import { Play, Square, Shield, Clock, Zap, Laptop, Activity, Music, Plus, Trash2, ListFilter, Cloud, Sparkles, Pin, PinOff, Eye } from "lucide-react";
 
 interface SessionState {
   is_focus_active: boolean;
@@ -41,12 +41,14 @@ export const DashboardView: React.FC = () => {
     is_overlay_visible: false,
   });
   const [taskInput, setTaskInput] = useState("");
-  const [authToken, setAuthToken] = useState("");
+  const [authToken, setAuthToken] = useState(() => localStorage.getItem("backend_auth_token") || "");
   const [groqApiKey, setGroqApiKey] = useState(() => localStorage.getItem("groq_api_key") || "");
   const [rules, setRules] = useState<ProcessRule[]>([]);
   const [newProcessName, setNewProcessName] = useState("");
   const [newCategory, setNewCategory] = useState<"whitelist" | "blacklist">("whitelist");
   const [activeTab, setActiveTab] = useState<"focus" | "rules">("focus");
+  const [showHud, setShowHud] = useState(false);
+  const [hudPinned, setHudPinned] = useState(false);
 
   const [osInfo, setOsInfo] = useState<{ window: ActiveWindowInfo; media: MediaStatus }>({
     window: { title: "", process_name: "", is_empty: true },
@@ -83,25 +85,67 @@ export const DashboardView: React.FC = () => {
     }
   };
 
+  const syncRemote = async () => {
+    if (!authToken.trim()) return;
+    try {
+      await invoke("sync_remote_session", { token: authToken.trim() });
+    } catch {
+      // Best-effort remote sync
+    }
+  };
+
+  const triggerHudGlance = () => {
+    setShowHud(true);
+    if (!hudPinned) {
+      setTimeout(() => {
+        setShowHud(false);
+      }, 2500);
+    }
+  };
+
+  const handleAuthTokenChange = (token: string) => {
+    setAuthToken(token);
+    localStorage.setItem("backend_auth_token", token);
+  };
+
   useEffect(() => {
     refreshStatus();
     refreshRules();
+    syncRemote();
+
     const savedGroqKey = localStorage.getItem("groq_api_key");
     if (savedGroqKey) {
       invoke("set_groq_api_key", { key: savedGroqKey.trim() || null }).catch(console.error);
     }
 
     const interval = setInterval(pollOsInfo, 1500);
+    const syncInterval = setInterval(syncRemote, 10000);
 
-    const unlistenPromise = listen<SessionState>("session-changed", (event) => {
+    const unlistenSessionPromise = listen<SessionState>("session-changed", (event) => {
       setSession(event.payload);
     });
 
+    const unlistenHudPromise = listen("toggle-task-hud", () => {
+      triggerHudGlance();
+    });
+
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.ctrlKey && e.altKey && e.code === "Space") {
+        e.preventDefault();
+        triggerHudGlance();
+      }
+    };
+
+    window.addEventListener("keydown", handleKeyDown);
+
     return () => {
       clearInterval(interval);
-      unlistenPromise.then((unlisten) => unlisten());
+      clearInterval(syncInterval);
+      window.removeEventListener("keydown", handleKeyDown);
+      unlistenSessionPromise.then((unlisten) => unlisten());
+      unlistenHudPromise.then((unlisten) => unlisten());
     };
-  }, []);
+  }, [authToken, hudPinned]);
 
   const handleGroqKeyChange = async (key: string) => {
     setGroqApiKey(key);
@@ -184,7 +228,15 @@ export const DashboardView: React.FC = () => {
           </div>
         </div>
 
-        <div className="flex items-center gap-1.5">
+        <div className="flex items-center gap-2">
+          <button
+            onClick={triggerHudGlance}
+            title="Click or press Ctrl+Alt+Space for quick glance"
+            className="text-[10px] text-slate-400 hover:text-slate-200 bg-slate-800/80 hover:bg-slate-800 px-2 py-1 rounded border border-slate-700/60 transition-colors flex items-center gap-1 cursor-pointer"
+          >
+            <Eye className="w-3 h-3 text-purple-400" />
+            <span>Ctrl+Alt+Space</span>
+          </button>
           <span
             className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium border ${
               session.is_focus_active
@@ -201,6 +253,41 @@ export const DashboardView: React.FC = () => {
           </span>
         </div>
       </header>
+
+      {/* Ambient Task Glance HUD (Ctrl+Alt+Space) */}
+      {(showHud || hudPinned) && (
+        <div className="mx-5 mt-3 p-3 rounded-xl bg-purple-950/80 border border-purple-500/40 backdrop-blur-md shadow-lg flex items-center justify-between text-xs animate-in fade-in slide-in-from-top duration-200">
+          <div className="flex items-center gap-2.5">
+            <div className="p-1 rounded-md bg-purple-500/20 text-purple-300">
+              <Eye className="w-3.5 h-3.5" />
+            </div>
+            <div>
+              <span className="text-[10px] text-purple-300 font-semibold uppercase tracking-wider block">
+                Active Focus Target
+              </span>
+              <span className="font-medium text-white text-xs truncate max-w-[220px] block">
+                {session.task_title || "Deep Work"}
+              </span>
+            </div>
+          </div>
+          <div className="flex items-center gap-2">
+            <span className="font-mono text-purple-200 text-xs font-semibold px-2 py-0.5 rounded bg-purple-900/60 border border-purple-700/50">
+              {session.duration_minutes}:00
+            </span>
+            <button
+              onClick={() => setHudPinned(!hudPinned)}
+              title={hudPinned ? "Unpin HUD" : "Pin HUD"}
+              className={`p-1.5 rounded transition-colors cursor-pointer ${
+                hudPinned
+                  ? "bg-purple-600 text-white"
+                  : "text-purple-300 hover:text-white hover:bg-purple-800/40"
+              }`}
+            >
+              {hudPinned ? <PinOff className="w-3 h-3" /> : <Pin className="w-3 h-3" />}
+            </button>
+          </div>
+        </div>
+      )}
 
       {/* Navigation Tabs */}
       <div className="flex border-b border-slate-800/60 bg-slate-900/20 px-5 text-xs">
@@ -256,13 +343,15 @@ export const DashboardView: React.FC = () => {
                   <Cloud className="w-3.5 h-3.5 text-blue-400" />
                   <span>Task Buddy API Sync</span>
                 </span>
-                <span className="text-[10px] text-emerald-400">Offline SQLite Active</span>
+                <span className={`text-[10px] ${authToken ? "text-blue-400" : "text-emerald-400"}`}>
+                  {authToken ? "SSE Web Sync Active" : "Offline SQLite Active"}
+                </span>
               </div>
               <input
                 type="password"
                 disabled={session.is_focus_active}
                 value={authToken}
-                onChange={(e) => setAuthToken(e.target.value)}
+                onChange={(e) => handleAuthTokenChange(e.target.value)}
                 placeholder="Paste Bearer Token to sync streaks (optional)"
                 className="w-full px-2.5 py-1.5 text-xs bg-slate-950 border border-slate-800 rounded text-slate-300 placeholder-slate-600 focus:outline-none focus:border-blue-500"
               />

@@ -105,6 +105,14 @@ impl RulesEngine {
             };
         }
 
+        // 2.5 Task Buddy web app is always allowed in any browser
+        let title_lower = window.title.to_lowercase();
+        if title_lower.contains("task buddy") || title_lower.contains("localhost:3000") {
+            return EvaluationResult::Allow {
+                reason: "Task Buddy web application whitelisted",
+            };
+        }
+
         // 3. Media playback tracking
         if media.is_playing {
             self.was_playing = true;
@@ -230,6 +238,21 @@ mod tests {
         engine.pause_started_at = Some(Instant::now() - Duration::from_secs(35));
         let res2 = engine.evaluate(true, &win, &med_paused, true);
         assert_eq!(res2, EvaluationResult::TriggerBarrier { reason: "Tutorial paused beyond 30-second coding grace buffer" });
+    }
+
+    #[test]
+    fn test_task_buddy_browser_window_is_whitelisted() {
+        let mut engine = RulesEngine::new();
+        let mut win = dummy_window("chrome.exe");
+        win.title = "Task Buddy — Focus & Planner".to_string();
+        let med = dummy_media(false, "");
+        let res = engine.evaluate(true, &win, &med, true);
+        assert_eq!(
+            res,
+            EvaluationResult::Allow {
+                reason: "Task Buddy web application whitelisted"
+            }
+        );
     }
 }
 

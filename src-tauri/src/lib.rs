@@ -228,6 +228,109 @@ fn dismiss_barrier(app: AppHandle, state: State<'_, AppState>) -> Result<(), Str
     Ok(())
 }
 
+#[tauri::command]
+async fn record_barrier_bypass(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    token: Option<String>,
+    reason: Option<String>,
+) -> Result<Option<sync::DiversionPenaltyResult>, String> {
+    let (sess_id, remote_id, auth_token) = {
+        let mut session = state.session.lock().unwrap();
+        session.is_overlay_visible = false;
+        (
+            session.session_id.clone(),
+            session.remote_session_id,
+            token.or_else(|| session.backend_token.clone()),
+        )
+    };
+
+    // Log bypass in local SQLite
+    let div_record = db::DiversionEventRecord {
+        id: format!("div_{}", Utc::now().timestamp_millis()),
+        session_id: sess_id,
+        timestamp: Utc::now().to_rfc3339(),
+        trigger_type: reason.clone().unwrap_or_else(|| "manual_bypass".to_string()),
+        detected_title: None,
+        bypassed: true,
+    };
+    let _ = state.db.record_diversion(&div_record);
+
+    if let Some(overlay) = app.get_webview_window("overlay") {
+        let _ = overlay.hide();
+    }
+
+    if let Some(tok) = auth_token {
+        if !tok.trim().is_empty() {
+            let res = state
+                .sync_client
+                .record_diversion_penalty(
+                    &tok,
+                    remote_id,
+                    &reason.unwrap_or_else(|| "barrier_force_bypass".to_string()),
+                    15.0,
+                )
+                .await?;
+            return Ok(Some(res));
+        }
+    }
+
+    Ok(None)
+}
+
+#[tauri::command]
+async fn sync_remote_session(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    token: String,
+) -> Result<Option<sync::RemoteSessionState>, String> {
+    if token.trim().is_empty() {
+        return Ok(None);
+    }
+
+    let remote_state = state
+        .sync_client
+        .fetch_active_session_snapshot(&token)
+        .await?;
+
+    if let Some(ref remote) = remote_state {
+        let mut session = state.session.lock().unwrap();
+        session.backend_token = Some(token.clone());
+
+        if remote.is_active {
+            if let Some(ref phase) = remote.current_phase {
+                let should_be_active = phase.kind == "focus" && phase.status == "active";
+                if session.is_focus_active != should_be_active {
+                    session.is_focus_active = should_be_active;
+                    if let Some(ref label) = remote.activity_label {
+                        session.task_title = label.clone();
+                    }
+                    session.remote_session_id = remote.session_id;
+                    let snapshot = session.clone();
+                    let _ = app.emit("session-changed", &snapshot);
+                }
+            }
+        } else if session.is_focus_active {
+            // Remote session ended -> drop to Free Time
+            session.is_focus_active = false;
+            session.is_overlay_visible = false;
+            if let Some(overlay) = app.get_webview_window("overlay") {
+                let _ = overlay.hide();
+            }
+            let snapshot = session.clone();
+            let _ = app.emit("session-changed", &snapshot);
+        }
+    }
+
+    Ok(remote_state)
+}
+
+#[tauri::command]
+fn toggle_task_hud(app: AppHandle) -> Result<(), String> {
+    let _ = app.emit("toggle-task-hud", ());
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let db_instance = db::Database::new("task_buddy_desktop.db").expect("Failed to initialize SQLite database");
@@ -260,6 +363,9 @@ pub fn run() {
             end_focus_session,
             trigger_barrier,
             dismiss_barrier,
+            record_barrier_bypass,
+            sync_remote_session,
+            toggle_task_hud,
         ])
         .setup(move |app| {
             // Spawn Background OS Monitor Thread with dynamic SQLite rules and AI matcher
