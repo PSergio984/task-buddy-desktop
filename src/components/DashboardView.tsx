@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { Play, Square, Shield, Clock, Zap, Laptop, Activity, Music, Plus, Trash2, ListFilter, Cloud } from "lucide-react";
+import { Play, Square, Shield, Clock, Zap, Laptop, Activity, Music, Plus, Trash2, ListFilter, Cloud, Sparkles } from "lucide-react";
 
 interface SessionState {
   is_focus_active: boolean;
@@ -42,6 +42,7 @@ export const DashboardView: React.FC = () => {
   });
   const [taskInput, setTaskInput] = useState("");
   const [authToken, setAuthToken] = useState("");
+  const [groqApiKey, setGroqApiKey] = useState(() => localStorage.getItem("groq_api_key") || "");
   const [rules, setRules] = useState<ProcessRule[]>([]);
   const [newProcessName, setNewProcessName] = useState("");
   const [newCategory, setNewCategory] = useState<"whitelist" | "blacklist">("whitelist");
@@ -85,7 +86,10 @@ export const DashboardView: React.FC = () => {
   useEffect(() => {
     refreshStatus();
     refreshRules();
-    pollOsInfo();
+    const savedGroqKey = localStorage.getItem("groq_api_key");
+    if (savedGroqKey) {
+      invoke("set_groq_api_key", { key: savedGroqKey.trim() || null }).catch(console.error);
+    }
 
     const interval = setInterval(pollOsInfo, 1500);
 
@@ -98,6 +102,16 @@ export const DashboardView: React.FC = () => {
       unlistenPromise.then((unlisten) => unlisten());
     };
   }, []);
+
+  const handleGroqKeyChange = async (key: string) => {
+    setGroqApiKey(key);
+    localStorage.setItem("groq_api_key", key);
+    try {
+      await invoke("set_groq_api_key", { key: key.trim() || null });
+    } catch (err) {
+      console.error("Failed to update Groq API key:", err);
+    }
+  };
 
   const handleStartSession = async (minutes: number) => {
     try {
@@ -251,6 +265,26 @@ export const DashboardView: React.FC = () => {
                 onChange={(e) => setAuthToken(e.target.value)}
                 placeholder="Paste Bearer Token to sync streaks (optional)"
                 className="w-full px-2.5 py-1.5 text-xs bg-slate-950 border border-slate-800 rounded text-slate-300 placeholder-slate-600 focus:outline-none focus:border-blue-500"
+              />
+            </div>
+
+            {/* AI Semantic Guard (Groq) */}
+            <div className="p-3.5 rounded-xl bg-slate-900/30 border border-slate-800/80 space-y-1.5">
+              <div className="flex items-center justify-between text-xs">
+                <span className="font-medium text-slate-300 flex items-center gap-1.5">
+                  <Sparkles className="w-3.5 h-3.5 text-purple-400" />
+                  <span>AI Semantic Guard (Groq)</span>
+                </span>
+                <span className={`text-[10px] ${groqApiKey ? "text-purple-400" : "text-slate-400"}`}>
+                  {groqApiKey ? "gpt-oss-20b Online" : "Offline Fallback"}
+                </span>
+              </div>
+              <input
+                type="password"
+                value={groqApiKey}
+                onChange={(e) => handleGroqKeyChange(e.target.value)}
+                placeholder="Paste Groq API Key (gsk_...) for LLM matching"
+                className="w-full px-2.5 py-1.5 text-xs bg-slate-950 border border-slate-800 rounded text-slate-300 placeholder-slate-600 focus:outline-none focus:border-purple-500"
               />
             </div>
 

@@ -77,6 +77,7 @@ impl RulesEngine {
         is_focus_active: bool,
         window: &ActiveWindowInfo,
         media: &MediaStatus,
+        is_media_aligned: bool,
     ) -> EvaluationResult {
         // In Free Time, barriers are 100% disabled
         if !is_focus_active {
@@ -108,8 +109,16 @@ impl RulesEngine {
         if media.is_playing {
             self.was_playing = true;
             self.pause_started_at = None;
+
+            // If media is verified unaligned with declared task, trigger barrier
+            if !is_media_aligned && !media.title.is_empty() {
+                return EvaluationResult::TriggerBarrier {
+                    reason: "Media playback does not align with declared hourly task",
+                };
+            }
+
             return EvaluationResult::Allow {
-                reason: "Tutorial media is actively playing",
+                reason: "Tutorial media is actively playing and aligned",
             };
         }
 
@@ -134,3 +143,93 @@ impl RulesEngine {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dummy_window(proc: &str) -> ActiveWindowInfo {
+        ActiveWindowInfo {
+            title: "Test Window".to_string(),
+            process_name: proc.to_string(),
+            is_empty: false,
+        }
+    }
+
+    fn dummy_media(playing: bool, title: &str) -> MediaStatus {
+        MediaStatus {
+            has_active_media: true,
+            is_playing: playing,
+            title: title.to_string(),
+            artist: "Test Artist".to_string(),
+            source_app_id: "chrome.exe".to_string(),
+        }
+    }
+
+    #[test]
+    fn test_free_time_always_allows() {
+        let mut engine = RulesEngine::new();
+        let win = dummy_window("steam.exe");
+        let med = dummy_media(false, "Random");
+        let res = engine.evaluate(false, &win, &med, true);
+        assert_eq!(res, EvaluationResult::Allow { reason: "Free Time active (0 barriers)" });
+    }
+
+    #[test]
+    fn test_blacklisted_app_triggers_barrier() {
+        let mut engine = RulesEngine::new();
+        let win = dummy_window("discord.exe");
+        let med = dummy_media(false, "");
+        let res = engine.evaluate(true, &win, &med, true);
+        assert_eq!(res, EvaluationResult::TriggerBarrier { reason: "Blacklisted distraction application active" });
+    }
+
+    #[test]
+    fn test_whitelisted_ide_always_allows() {
+        let mut engine = RulesEngine::new();
+        let win = dummy_window("cursor.exe");
+        let med = dummy_media(false, "");
+        let res = engine.evaluate(true, &win, &med, true);
+        assert_eq!(res, EvaluationResult::Allow { reason: "Active development tool whitelisted" });
+    }
+
+    #[test]
+    fn test_media_misaligned_triggers_barrier() {
+        let mut engine = RulesEngine::new();
+        let win = dummy_window("chrome.exe");
+        let med = dummy_media(true, "Top Funny Cat Clips");
+        let res = engine.evaluate(true, &win, &med, false);
+        assert_eq!(res, EvaluationResult::TriggerBarrier { reason: "Media playback does not align with declared hourly task" });
+    }
+
+    #[test]
+    fn test_media_aligned_playing_allows() {
+        let mut engine = RulesEngine::new();
+        let win = dummy_window("chrome.exe");
+        let med = dummy_media(true, "Rust Async in Tauri");
+        let res = engine.evaluate(true, &win, &med, true);
+        assert_eq!(res, EvaluationResult::Allow { reason: "Tutorial media is actively playing and aligned" });
+    }
+
+    #[test]
+    fn test_coding_grace_buffer_trigger() {
+        let mut engine = RulesEngine::new();
+        let win = dummy_window("chrome.exe");
+        
+        // 1. Media playing
+        let med_playing = dummy_media(true, "Rust Tutorial");
+        engine.evaluate(true, &win, &med_playing, true);
+        assert!(engine.was_playing);
+
+        // 2. Media paused just now (within 30s)
+        let med_paused = dummy_media(false, "Rust Tutorial");
+        let res1 = engine.evaluate(true, &win, &med_paused, true);
+        assert_eq!(res1, EvaluationResult::Allow { reason: "Within 30-second coding grace buffer" });
+
+        // 3. Fast-forward pause time past 30 seconds
+        engine.pause_started_at = Some(Instant::now() - Duration::from_secs(35));
+        let res2 = engine.evaluate(true, &win, &med_paused, true);
+        assert_eq!(res2, EvaluationResult::TriggerBarrier { reason: "Tutorial paused beyond 30-second coding grace buffer" });
+    }
+}
+

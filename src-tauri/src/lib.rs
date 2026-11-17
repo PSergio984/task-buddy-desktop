@@ -1,3 +1,4 @@
+pub mod ai;
 pub mod db;
 pub mod monitor;
 pub mod sync;
@@ -27,6 +28,7 @@ pub struct AppState {
     pub session: Arc<Mutex<SessionState>>,
     pub db: db::Database,
     pub sync_client: sync::BackendSyncClient,
+    pub matcher: ai::ContentMatcher,
 }
 
 #[tauri::command]
@@ -70,6 +72,21 @@ fn get_recent_sessions(
     limit: u32,
 ) -> Result<Vec<db::FocusSessionRecord>, String> {
     state.db.get_recent_sessions(limit).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn set_groq_api_key(state: State<'_, AppState>, key: Option<String>) -> Result<(), String> {
+    state.matcher.set_api_key(key);
+    Ok(())
+}
+
+#[tauri::command]
+async fn check_content_alignment(
+    state: State<'_, AppState>,
+    task_title: String,
+    media_title: String,
+) -> Result<ai::MatchResult, String> {
+    Ok(state.matcher.is_aligned(&task_title, &media_title).await)
 }
 
 #[tauri::command]
@@ -215,11 +232,13 @@ fn dismiss_barrier(app: AppHandle, state: State<'_, AppState>) -> Result<(), Str
 pub fn run() {
     let db_instance = db::Database::new("task_buddy_desktop.db").expect("Failed to initialize SQLite database");
     let sync_client = sync::BackendSyncClient::default();
+    let matcher = ai::ContentMatcher::new();
 
     let app_state = AppState {
         session: Arc::new(Mutex::new(SessionState::default())),
         db: db_instance.clone(),
         sync_client,
+        matcher: matcher.clone(),
     };
 
     let session_ref = app_state.session.clone();
@@ -235,16 +254,19 @@ pub fn run() {
             add_local_rule,
             delete_local_rule,
             get_recent_sessions,
+            set_groq_api_key,
+            check_content_alignment,
             start_focus_session,
             end_focus_session,
             trigger_barrier,
             dismiss_barrier,
         ])
         .setup(move |app| {
-            // Spawn Background OS Monitor Thread with dynamic SQLite rules
+            // Spawn Background OS Monitor Thread with dynamic SQLite rules and AI matcher
             let monitor_handle = app.handle().clone();
             let monitor_session = session_ref.clone();
             let monitor_db = db_ref.clone();
+            let monitor_matcher = matcher.clone();
 
             std::thread::spawn(move || {
                 let mut rules = monitor::RulesEngine::new();
@@ -266,15 +288,22 @@ pub fn run() {
                         last_rules_update = std::time::Instant::now();
                     }
 
-                    let is_focus_active = {
+                    let (is_focus_active, active_task_title) = {
                         let lock = monitor_session.lock().unwrap();
-                        lock.is_focus_active
+                        (lock.is_focus_active, lock.task_title.clone())
                     };
 
                     let window = monitor::get_active_window_info();
                     let media = monitor::get_current_media_status();
 
-                    let eval = rules.evaluate(is_focus_active, &window, &media);
+                    // Evaluate content alignment if media is active
+                    let is_media_aligned = if media.has_active_media && !media.title.is_empty() && is_focus_active {
+                        monitor_matcher.evaluate_offline(&active_task_title, &media.title).aligned
+                    } else {
+                        true
+                    };
+
+                    let eval = rules.evaluate(is_focus_active, &window, &media, is_media_aligned);
                     if let monitor::EvaluationResult::TriggerBarrier { reason } = eval {
                         let mut session = monitor_session.lock().unwrap();
                         if session.is_focus_active && !session.is_overlay_visible {
