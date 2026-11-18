@@ -700,8 +700,15 @@ pub fn run() {
                         .build()
                     {
                         Ok(window) => {
-                            let _ = window.set_position(tauri::Position::Physical(*monitor.position()));
-                            let _ = window.set_fullscreen(true);
+                            if let Err(e) = window.set_position(tauri::Position::Physical(*monitor.position())) {
+                                eprintln!("[overlay] Failed to position secondary overlay on {label}: {e:?}");
+                            }
+                            if let Err(e) = window.set_fullscreen_on_monitor(tauri::PhysicalPosition::new(
+                                monitor.position().x as f64,
+                                monitor.position().y as f64,
+                            )) {
+                                eprintln!("[overlay] Failed to fullscreen secondary overlay on {label}: {e:?}");
+                            }
                         }
                         Err(e) => {
                             eprintln!("[overlay] Failed to spawn secondary overlay on {label}: {e:?}");
