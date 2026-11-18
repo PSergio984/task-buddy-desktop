@@ -14,6 +14,7 @@ pub struct MatchResult {
 pub struct ContentMatcher {
     api_key: Arc<Mutex<Option<String>>>,
     cache: Arc<Mutex<HashMap<(String, String), MatchResult>>>,
+    pending: Arc<Mutex<HashSet<(String, String)>>>,
     client: reqwest::Client,
 }
 
@@ -22,6 +23,7 @@ impl Default for ContentMatcher {
         Self {
             api_key: Arc::new(Mutex::new(None)),
             cache: Arc::new(Mutex::new(HashMap::new())),
+            pending: Arc::new(Mutex::new(HashSet::new())),
             client: reqwest::Client::builder()
                 .timeout(Duration::from_secs(10))
                 .build()
@@ -40,6 +42,7 @@ impl ContentMatcher {
         *lock = key.filter(|k| !k.trim().is_empty());
         let mut cache = self.cache.lock().unwrap();
         cache.clear();
+        self.pending.lock().unwrap().clear();
     }
 
     pub fn get_api_key(&self) -> Option<String> {
@@ -81,9 +84,12 @@ impl ContentMatcher {
             self.evaluate_offline(clean_task, clean_media)
         };
 
-        // Cache successful Groq API evaluations
+        // Cache successful Groq API evaluations with size bound (max 500 entries)
         if result.source == "groq_api" {
             let mut cache = self.cache.lock().unwrap();
+            if cache.len() >= 500 {
+                cache.clear();
+            }
             cache.insert(cache_key, result.clone());
         }
 
@@ -92,7 +98,7 @@ impl ContentMatcher {
 
     /// Evaluates alignment for native OS monitor loop without delaying polling intervals.
     /// Checks cache first; if missing and Groq API is configured, kicks off background async
-    /// cache population while immediately returning offline heuristic fallback.
+    /// cache population with in-flight deduplication while immediately returning offline heuristic.
     pub fn evaluate_monitor_alignment(&self, task_title: &str, media_title: &str) -> MatchResult {
         let clean_task = task_title.trim();
         let clean_media = media_title.trim();
@@ -115,14 +121,22 @@ impl ContentMatcher {
             }
         }
 
-        // 2. If Groq key is present, schedule background query to populate cache
+        // 2. If Groq key is present, schedule background query with in-flight deduplication
         if self.get_api_key().is_some() {
-            let matcher_clone = self.clone();
-            let task_s = clean_task.to_string();
-            let media_s = clean_media.to_string();
-            tauri::async_runtime::spawn(async move {
-                let _ = matcher_clone.is_aligned(&task_s, &media_s).await;
-            });
+            let mut pending = self.pending.lock().unwrap();
+            if !pending.contains(&cache_key) {
+                pending.insert(cache_key.clone());
+                drop(pending);
+
+                let matcher_clone = self.clone();
+                let task_s = clean_task.to_string();
+                let media_s = clean_media.to_string();
+                let pending_key = cache_key;
+                tauri::async_runtime::spawn(async move {
+                    let _ = matcher_clone.is_aligned(&task_s, &media_s).await;
+                    matcher_clone.pending.lock().unwrap().remove(&pending_key);
+                });
+            }
         }
 
         // 3. Fallback to immediate offline heuristic
@@ -247,23 +261,33 @@ impl ContentMatcher {
         .into_iter()
         .collect();
 
+        // Normalize tech names with symbols before delimiter splitting
+        let lower = text.to_lowercase();
+        let sanitized = lower
+            .replace("c++", " cpp ")
+            .replace("c#", " csharp ")
+            .replace("f#", " fsharp ");
+
+        // Exclude common verbs like 'go' to avoid false positives
         let short_tech_tokens: HashSet<&'static str> = [
-            "c", "r", "go", "c++", "c#", "ui", "ai", "db", "os", "ip", "js", "ts", "py", "rs",
+            "c", "r", "cpp", "csharp", "fsharp", "ui", "ai", "db", "os", "ip", "js", "ts", "py", "rs",
         ]
         .into_iter()
         .collect();
 
-        text.split(|c: char| !c.is_alphanumeric() && c != '+' && c != '#')
-            .map(|s| s.trim().to_lowercase())
+        sanitized
+            .split(|c: char| !c.is_alphanumeric())
+            .map(|s| s.trim())
             .filter(|s| {
                 if s.is_empty() {
                     return false;
                 }
-                if short_tech_tokens.contains(s.as_str()) {
+                if short_tech_tokens.contains(s) {
                     return true;
                 }
-                s.len() >= 3 && !stop_words.contains(s.as_str())
+                s.len() >= 3 && !stop_words.contains(s)
             })
+            .map(|s| s.to_string())
             .collect()
     }
 }
@@ -294,6 +318,13 @@ mod tests {
         let matcher = ContentMatcher::new();
         let res = matcher.evaluate_offline("Learn C++ templates", "Advanced C++ tutorial");
         assert!(res.aligned, "Expected 'c++' to match");
+    }
+
+    #[test]
+    fn test_plus_separated_tokens() {
+        let matcher = ContentMatcher::new();
+        let res = matcher.evaluate_offline("Build desktop with Rust+Tauri", "Tauri guide for Windows");
+        assert!(res.aligned, "Expected 'Tauri' from 'Rust+Tauri' to match");
     }
 
     #[test]

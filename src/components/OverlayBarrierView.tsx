@@ -34,15 +34,16 @@ export const OverlayBarrierView: React.FC = () => {
 
     const unlistenPromise = listen("session-changed", () => {
       checkStatus();
-    });
+    }).catch(console.error);
 
     return () => {
-      unlistenPromise.then((unlisten) => unlisten());
+      unlistenPromise.then((unlisten) => {
+        if (typeof unlisten === "function") unlisten();
+      });
     };
   }, []);
 
   const isHoldingRef = useRef(false);
-  isHoldingRef.current = isHolding;
 
   useEffect(() => {
     const isControlElement = (el: HTMLElement | null) => {
@@ -92,6 +93,7 @@ export const OverlayBarrierView: React.FC = () => {
 
   const startHold = () => {
     setIsHolding(true);
+    isHoldingRef.current = true;
     holdStartTimeRef.current = performance.now();
 
     const update = (now: number) => {
@@ -112,6 +114,7 @@ export const OverlayBarrierView: React.FC = () => {
 
   const cancelHold = () => {
     setIsHolding(false);
+    isHoldingRef.current = false;
     holdStartTimeRef.current = null;
     if (animFrameRef.current) cancelAnimationFrame(animFrameRef.current);
     setHoldProgress(0);

@@ -38,17 +38,24 @@ pub struct AppState {
     pub sync_client: sync::BackendSyncClient,
     pub matcher: ai::ContentMatcher,
     pub session_generation: Arc<AtomicU64>,
+    pub rules: Arc<Mutex<monitor::RulesEngine>>,
 }
 
 #[tauri::command]
 fn get_session_status(state: State<'_, AppState>) -> SessionState {
-    let mut session = state.session.lock().unwrap();
-    if session.is_focus_active {
-        if let Some(instant) = session.started_at_instant {
-            session.elapsed_seconds = instant.elapsed().as_secs() as u32;
-        }
-    }
-    session.clone()
+    let session = state.session.lock().unwrap();
+    let current_elapsed = if session.is_focus_active {
+        session.elapsed_seconds
+            + session
+                .started_at_instant
+                .map(|i| i.elapsed().as_secs() as u32)
+                .unwrap_or(0)
+    } else {
+        session.elapsed_seconds
+    };
+    let mut snapshot = session.clone();
+    snapshot.elapsed_seconds = current_elapsed;
+    snapshot
 }
 
 #[tauri::command]
@@ -120,7 +127,11 @@ fn internal_start_session(
     // If a session was already active, finalize its previous SQLite record
     if session.is_focus_active && !session.session_id.is_empty() {
         let ended_at = Utc::now().to_rfc3339();
-        let actual_sec = session.started_at_instant.map(|i| i.elapsed().as_secs() as u32).unwrap_or(0);
+        let actual_sec = session.elapsed_seconds
+            + session
+                .started_at_instant
+                .map(|i| i.elapsed().as_secs() as u32)
+                .unwrap_or(0);
         let _ = state.db.update_session_end(
             &session.session_id,
             &ended_at,
@@ -189,17 +200,23 @@ fn internal_start_session(
 fn internal_end_session(app: &AppHandle, state: &AppState) -> SessionState {
     state.session_generation.fetch_add(1, Ordering::SeqCst);
     let mut session = state.session.lock().unwrap();
+    let was_active = session.is_focus_active;
     session.is_focus_active = false;
     session.is_overlay_visible = false;
 
     let sess_id = session.session_id.clone();
     let remote_id = session.remote_session_id;
     let token = session.backend_token.clone();
-    let actual_sec = session.started_at_instant.map(|i| i.elapsed().as_secs() as u32).unwrap_or(session.elapsed_seconds);
+    let actual_sec = session.elapsed_seconds
+        + session
+            .started_at_instant
+            .map(|i| i.elapsed().as_secs() as u32)
+            .unwrap_or(0);
     let div_count = session.diversion_count;
+    session.elapsed_seconds = actual_sec;
     session.started_at_instant = None;
 
-    if !sess_id.is_empty() {
+    if was_active && !sess_id.is_empty() {
         let _ = state.db.update_session_end(
             &sess_id,
             &Utc::now().to_rfc3339(),
@@ -209,11 +226,13 @@ fn internal_end_session(app: &AppHandle, state: &AppState) -> SessionState {
         );
     }
 
-    if let (Some(t), Some(rid)) = (token, remote_id) {
-        let client = state.sync_client.clone();
-        tauri::async_runtime::spawn(async move {
-            let _ = client.stop_remote_session(&t, rid).await;
-        });
+    if was_active {
+        if let (Some(t), Some(rid)) = (token, remote_id) {
+            let client = state.sync_client.clone();
+            tauri::async_runtime::spawn(async move {
+                let _ = client.stop_remote_session(&t, rid).await;
+            });
+        }
     }
 
     if let Some(overlay) = app.get_webview_window("overlay") {
@@ -312,6 +331,12 @@ fn dismiss_barrier(app: AppHandle, state: State<'_, AppState>) -> Result<(), Str
     };
     let _ = state.db.record_diversion(&div_record);
 
+    state
+        .rules
+        .lock()
+        .unwrap()
+        .grant_bypass_grace(Duration::from_secs(60));
+
     if let Some(overlay) = app.get_webview_window("overlay") {
         let _ = overlay.hide();
     }
@@ -323,15 +348,13 @@ fn dismiss_barrier(app: AppHandle, state: State<'_, AppState>) -> Result<(), Str
 
 #[tauri::command]
 async fn record_barrier_bypass(
-    _app: AppHandle,
+    app: AppHandle,
     state: State<'_, AppState>,
     token: Option<String>,
     reason: Option<String>,
 ) -> Result<Option<sync::DiversionPenaltyResult>, String> {
     let (sess_id, remote_id, auth_token) = {
-        let mut session = state.session.lock().unwrap();
-        session.is_overlay_visible = false;
-        session.diversion_count += 1;
+        let session = state.session.lock().unwrap();
         (
             session.session_id.clone(),
             session.remote_session_id,
@@ -339,33 +362,46 @@ async fn record_barrier_bypass(
         )
     };
 
-    // Log bypass in local SQLite
-    let div_record = db::DiversionEventRecord {
-        id: format!("div_{}", Utc::now().timestamp_millis()),
-        session_id: sess_id,
-        timestamp: Utc::now().to_rfc3339(),
-        trigger_type: reason.clone().unwrap_or_else(|| "manual_bypass".to_string()),
-        detected_title: None,
-        bypassed: true,
-    };
-    let _ = state.db.record_diversion(&div_record);
+    let trigger_reason = reason.unwrap_or_else(|| "manual_bypass".to_string());
+    let mut penalty_res = None;
 
     if let Some(tok) = auth_token {
         if !tok.trim().is_empty() {
             let res = state
                 .sync_client
-                .record_diversion_penalty(
-                    &tok,
-                    remote_id,
-                    &reason.unwrap_or_else(|| "barrier_force_bypass".to_string()),
-                    15.0,
-                )
+                .record_diversion_penalty(&tok, remote_id, &trigger_reason, 15.0)
                 .await?;
-            return Ok(Some(res));
+            penalty_res = Some(res);
         }
     }
 
-    Ok(None)
+    // Only mutate session, log SQLite diversion, and grant grace after penalty call succeeds
+    {
+        let mut session = state.session.lock().unwrap();
+        session.is_overlay_visible = false;
+        session.diversion_count += 1;
+    }
+
+    let div_record = db::DiversionEventRecord {
+        id: format!("div_{}", Utc::now().timestamp_millis()),
+        session_id: sess_id,
+        timestamp: Utc::now().to_rfc3339(),
+        trigger_type: trigger_reason,
+        detected_title: None,
+        bypassed: true,
+    };
+    let _ = state.db.record_diversion(&div_record);
+
+    state
+        .rules
+        .lock()
+        .unwrap()
+        .grant_bypass_grace(Duration::from_secs(60));
+
+    let snapshot = state.session.lock().unwrap().clone();
+    let _ = app.emit("session-changed", &snapshot);
+
+    Ok(penalty_res)
 }
 
 #[tauri::command]
@@ -429,19 +465,29 @@ async fn sync_remote_session(
 
         if remote.is_active {
             let mut changed = false;
+            let mut newly_created_in_tick = false;
+
             if let Some(ref phase) = remote.current_phase {
                 let should_be_active = phase.kind == "focus" && phase.status == "active";
                 if session.is_focus_active != should_be_active {
                     session.is_focus_active = should_be_active;
                     if !should_be_active {
+                        // Pause elapsed focus timer when transitioning to break
+                        if let Some(instant) = session.started_at_instant.take() {
+                            session.elapsed_seconds += instant.elapsed().as_secs() as u32;
+                        }
                         session.is_overlay_visible = false;
                         if let Some(overlay) = app.get_webview_window("overlay") {
                             let _ = overlay.hide();
                         }
+                    } else {
+                        // Resumed focus
+                        session.started_at_instant = Some(std::time::Instant::now());
                     }
-                    if should_be_active && session.session_id.is_empty() {
+                    if should_be_active && session.session_id.is_empty() && session.remote_session_id == remote.session_id {
                         let new_id = format!("sync_{}", Utc::now().timestamp_millis());
                         session.session_id = new_id.clone();
+                        session.elapsed_seconds = 0;
                         session.started_at_instant = Some(std::time::Instant::now());
                         session.shield_spent = false;
                         session.tactical_shield_until = None;
@@ -459,6 +505,7 @@ async fn sync_remote_session(
                             synced_to_backend: true,
                         };
                         let _ = state.db.insert_session(&record);
+                        newly_created_in_tick = true;
                     }
                     changed = true;
                 }
@@ -474,10 +521,14 @@ async fn sync_remote_session(
                 }
             }
             if session.remote_session_id != remote.session_id {
-                // If previous session was active, finalize its local record
-                if session.is_focus_active && !session.session_id.is_empty() {
+                // If previous session was active and not newly created in this tick, finalize its local record
+                if !newly_created_in_tick && session.is_focus_active && !session.session_id.is_empty() {
                     let ended_at = Utc::now().to_rfc3339();
-                    let actual_sec = session.started_at_instant.map(|i| i.elapsed().as_secs() as u32).unwrap_or(0);
+                    let actual_sec = session.elapsed_seconds
+                        + session
+                            .started_at_instant
+                            .map(|i| i.elapsed().as_secs() as u32)
+                            .unwrap_or(0);
                     let _ = state.db.update_session_end(
                         &session.session_id,
                         &ended_at,
@@ -489,7 +540,12 @@ async fn sync_remote_session(
                 let new_id = format!("sync_{}", Utc::now().timestamp_millis());
                 session.session_id = new_id.clone();
                 session.remote_session_id = remote.session_id;
-                session.started_at_instant = Some(std::time::Instant::now());
+                session.elapsed_seconds = 0;
+                session.started_at_instant = if session.is_focus_active {
+                    Some(std::time::Instant::now())
+                } else {
+                    None
+                };
                 session.shield_spent = false;
                 session.tactical_shield_until = None;
                 session.diversion_count = 0;
@@ -519,8 +575,13 @@ async fn sync_remote_session(
             session.is_overlay_visible = false;
             let sess_id = session.session_id.clone();
             let ended_at = Utc::now().to_rfc3339();
-            let actual_sec = session.started_at_instant.map(|i| i.elapsed().as_secs() as u32).unwrap_or(0);
+            let actual_sec = session.elapsed_seconds
+                + session
+                    .started_at_instant
+                    .map(|i| i.elapsed().as_secs() as u32)
+                    .unwrap_or(0);
             let div_count = session.diversion_count;
+            session.elapsed_seconds = actual_sec;
             session.started_at_instant = None;
             session.remote_session_id = None;
             let _ = state.db.update_session_end(&sess_id, &ended_at, actual_sec, "completed", div_count);
@@ -569,6 +630,7 @@ pub fn run() {
             let db_instance = db::Database::new(&db_path).expect("Failed to initialize SQLite database");
             let sync_client = sync::BackendSyncClient::default();
             let matcher = ai::ContentMatcher::new();
+            let rules_engine = Arc::new(Mutex::new(monitor::RulesEngine::new()));
 
             let app_state = AppState {
                 session: Arc::new(Mutex::new(SessionState::default())),
@@ -576,11 +638,13 @@ pub fn run() {
                 sync_client,
                 matcher: matcher.clone(),
                 session_generation: Arc::new(AtomicU64::new(0)),
+                rules: rules_engine.clone(),
             };
 
             let session_ref = app_state.session.clone();
             let db_ref = db_instance.clone();
             let matcher_ref = matcher.clone();
+            let rules_ref = rules_engine.clone();
 
             app.manage(app_state);
 
@@ -596,6 +660,7 @@ pub fn run() {
             let monitor_session = session_ref.clone();
             let monitor_db = db_ref.clone();
             let monitor_matcher = matcher_ref.clone();
+            let monitor_rules = rules_ref.clone();
 
             std::thread::spawn(move || {
                 unsafe {
@@ -604,12 +669,11 @@ pub fn run() {
                     );
                 }
 
-                let mut rules = monitor::RulesEngine::new();
                 let mut last_rules_update = std::time::Instant::now();
 
                 // Initial rules load
                 if let Ok(initial_rules) = monitor_db.get_rules() {
-                    rules.update_rules(&initial_rules);
+                    monitor_rules.lock().unwrap().update_rules(&initial_rules);
                 }
 
                 loop {
@@ -618,7 +682,7 @@ pub fn run() {
                     // Refresh custom rules from SQLite every 5 seconds
                     if last_rules_update.elapsed() > Duration::from_secs(5) {
                         if let Ok(updated_rules) = monitor_db.get_rules() {
-                            rules.update_rules(&updated_rules);
+                            monitor_rules.lock().unwrap().update_rules(&updated_rules);
                         }
                         last_rules_update = std::time::Instant::now();
                     }
@@ -631,7 +695,10 @@ pub fn run() {
                     if let Some(until) = shield_until {
                         let now_ms = Utc::now().timestamp_millis();
                         if now_ms < until {
-                            rules.grant_tactical_shield(Duration::from_millis((until - now_ms) as u64));
+                            monitor_rules
+                                .lock()
+                                .unwrap()
+                                .grant_tactical_shield(Duration::from_millis((until - now_ms) as u64));
                         }
                     }
 
@@ -645,32 +712,43 @@ pub fn run() {
                         true
                     };
 
-                    let eval = rules.evaluate(is_focus_active, &window, &media, is_media_aligned);
+                    let eval = monitor_rules
+                        .lock()
+                        .unwrap()
+                        .evaluate(is_focus_active, &window, &media, is_media_aligned);
                     if let monitor::EvaluationResult::TriggerBarrier { reason } = eval {
-                        let mut session = monitor_session.lock().unwrap();
-                        if session.is_focus_active && !session.is_overlay_visible {
-                            session.is_overlay_visible = true;
-                            // Synchronize overlay presentation before dropping session lock
+                        let mut trigger_overlay = false;
+                        let mut snapshot_opt = None;
+                        let mut sess_id_opt = None;
+                        {
+                            let mut session = monitor_session.lock().unwrap();
+                            if session.is_focus_active && !session.is_overlay_visible {
+                                session.is_overlay_visible = true;
+                                trigger_overlay = true;
+                                snapshot_opt = Some(session.clone());
+                                sess_id_opt = Some(session.session_id.clone());
+                            }
+                        }
+                        if trigger_overlay {
+                            // Synchronize overlay presentation after dropping session lock to prevent deadlock
                             if let Some(overlay) = monitor_handle.get_webview_window("overlay") {
                                 let _ = overlay.show();
                                 let _ = overlay.set_focus();
                             }
-                            let snapshot = session.clone();
-                            let sess_id = session.session_id.clone();
-                            drop(session);
-
-                            // Record diversion event in SQLite
-                            let div = db::DiversionEventRecord {
-                                id: format!("div_{}", Utc::now().timestamp_millis()),
-                                session_id: sess_id,
-                                timestamp: Utc::now().to_rfc3339(),
-                                trigger_type: reason.to_string(),
-                                detected_title: Some(window.title.clone()),
-                                bypassed: false,
-                            };
-                            let _ = monitor_db.record_diversion(&div);
-
-                            let _ = monitor_handle.emit("session-changed", &snapshot);
+                            if let Some(sess_id) = sess_id_opt {
+                                let div = db::DiversionEventRecord {
+                                    id: format!("div_{}", Utc::now().timestamp_millis()),
+                                    session_id: sess_id,
+                                    timestamp: Utc::now().to_rfc3339(),
+                                    trigger_type: reason.to_string(),
+                                    detected_title: Some(window.title.clone()),
+                                    bypassed: false,
+                                };
+                                let _ = monitor_db.record_diversion(&div);
+                            }
+                            if let Some(snapshot) = snapshot_opt {
+                                let _ = monitor_handle.emit("session-changed", &snapshot);
+                            }
                             let _ = monitor_handle.emit("barrier-triggered", reason);
                         }
                     }
@@ -737,10 +815,12 @@ pub fn run() {
                 .on_menu_event(|app, event| match event.id.as_ref() {
                     "start_25" => {
                         let state = app.state::<AppState>();
+                        state.session_generation.fetch_add(1, Ordering::SeqCst);
                         let _ = internal_start_session(app, &state, "Focus Session (25m)".to_string(), 25, None, None);
                     }
                     "start_50" => {
                         let state = app.state::<AppState>();
+                        state.session_generation.fetch_add(1, Ordering::SeqCst);
                         let _ = internal_start_session(app, &state, "Deep Focus (50m)".to_string(), 50, None, None);
                     }
                     "end_session" => {

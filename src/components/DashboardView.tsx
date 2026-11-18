@@ -109,6 +109,21 @@ export const DashboardView: React.FC = () => {
   const hudPinnedRef = useRef(hudPinned);
   hudPinnedRef.current = hudPinned;
   const glanceTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const actionErrorTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const setFeedbackError = (msg: string | null) => {
+    if (actionErrorTimeoutRef.current) {
+      clearTimeout(actionErrorTimeoutRef.current);
+      actionErrorTimeoutRef.current = null;
+    }
+    setActionError(msg);
+    if (msg) {
+      actionErrorTimeoutRef.current = setTimeout(() => {
+        setActionError(null);
+        actionErrorTimeoutRef.current = null;
+      }, 4000);
+    }
+  };
 
   const triggerHudGlance = () => {
     setShowHud(true);
@@ -169,6 +184,9 @@ export const DashboardView: React.FC = () => {
       if (glanceTimeoutRef.current) {
         clearTimeout(glanceTimeoutRef.current);
       }
+      if (actionErrorTimeoutRef.current) {
+        clearTimeout(actionErrorTimeoutRef.current);
+      }
       window.removeEventListener("keydown", handleKeyDown);
       unlistenSessionPromise.then((unlisten) => unlisten());
       unlistenHudPromise.then((unlisten) => unlisten());
@@ -210,9 +228,9 @@ export const DashboardView: React.FC = () => {
           signal: controller.signal,
         });
 
-        if (response.status === 401 || response.status === 403) {
+        if (response.status >= 400 && response.status < 500) {
           setSseStatus("auth_error");
-          return; // Non-retryable authentication failure
+          return; // Non-retryable client / authentication failure
         }
 
         if (!response.ok || !response.body) {
@@ -306,11 +324,10 @@ export const DashboardView: React.FC = () => {
         token: committedToken.trim() || null,
       });
       setSession(res);
-      setActionError(null);
+      setFeedbackError(null);
     } catch (err: any) {
       console.error("Failed to start session:", err);
-      setActionError(`Failed to start session: ${err}`);
-      setTimeout(() => setActionError(null), 4000);
+      setFeedbackError(`Failed to start session: ${err}`);
     } finally {
       setIsStartingSession(false);
     }
@@ -320,11 +337,10 @@ export const DashboardView: React.FC = () => {
     try {
       const res = await invoke<SessionState>("end_focus_session");
       setSession(res);
-      setActionError(null);
+      setFeedbackError(null);
     } catch (err: any) {
       console.error("Failed to end session:", err);
-      setActionError(`Failed to end session: ${err}`);
-      setTimeout(() => setActionError(null), 4000);
+      setFeedbackError(`Failed to end session: ${err}`);
     }
   };
 
@@ -339,11 +355,10 @@ export const DashboardView: React.FC = () => {
       });
       setNewProcessName("");
       refreshRules();
-      setActionError(null);
+      setFeedbackError(null);
     } catch (err: any) {
       console.error("Failed to add rule:", err);
-      setActionError(`Failed to add rule: ${err}`);
-      setTimeout(() => setActionError(null), 4000);
+      setFeedbackError(`Failed to add rule: ${err}`);
     }
   };
 
@@ -351,11 +366,10 @@ export const DashboardView: React.FC = () => {
     try {
       await invoke("delete_local_rule", { id });
       refreshRules();
-      setActionError(null);
+      setFeedbackError(null);
     } catch (err: any) {
       console.error("Failed to delete rule:", err);
-      setActionError(`Failed to delete rule: ${err}`);
-      setTimeout(() => setActionError(null), 4000);
+      setFeedbackError(`Failed to delete rule: ${err}`);
     }
   };
 
@@ -480,6 +494,19 @@ export const DashboardView: React.FC = () => {
 
       {/* Main Body */}
       <main className="flex-1 p-5 flex flex-col justify-between overflow-y-auto space-y-4">
+        {/* Error Notification rendered on both Focus and Rules tabs */}
+        {actionError && (
+          <div className="p-3 rounded-xl bg-red-500/10 border border-red-500/20 text-red-400 text-xs flex items-center justify-between">
+            <span>{actionError}</span>
+            <button
+              onClick={() => setFeedbackError(null)}
+              className="text-red-400 hover:text-red-200 text-xs px-1 cursor-pointer"
+            >
+              ✕
+            </button>
+          </div>
+        )}
+
         {activeTab === "focus" ? (
           <div className="space-y-4">
             {/* Active Task Card */}
@@ -527,7 +554,7 @@ export const DashboardView: React.FC = () => {
                     : sseStatus === "connecting"
                     ? "Connecting SSE Sync..."
                     : sseStatus === "auth_error"
-                    ? "Sync Auth Invalid (401)"
+                    ? "Sync Auth Invalid"
                     : "Sync Disconnected"}
                 </span>
               </div>
@@ -564,19 +591,6 @@ export const DashboardView: React.FC = () => {
                 className="w-full px-2.5 py-1.5 text-xs bg-slate-950 border border-slate-800 rounded text-slate-300 placeholder-slate-600 focus:outline-none focus:border-purple-500"
               />
             </div>
-
-            {/* Error Notification */}
-            {actionError && (
-              <div className="p-3 rounded-xl bg-red-500/10 border border-red-500/20 text-red-400 text-xs flex items-center justify-between">
-                <span>{actionError}</span>
-                <button
-                  onClick={() => setActionError(null)}
-                  className="text-red-400 hover:text-red-200 text-xs px-1 cursor-pointer"
-                >
-                  ✕
-                </button>
-              </div>
-            )}
 
             {/* Session Controller */}
             <div className="p-4 rounded-xl bg-slate-900/60 border border-slate-800 space-y-3">

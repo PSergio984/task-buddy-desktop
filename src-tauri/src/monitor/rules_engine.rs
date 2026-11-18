@@ -145,9 +145,19 @@ impl RulesEngine {
         // 3. Process lookup failure check: fail closed if title matches blacklisted keywords
         if window.lookup_failed && !window.title.is_empty() {
             let t = window.title.to_lowercase();
-            for item in DEFAULT_BLACKLIST {
+            let words: std::collections::HashSet<&str> = t
+                .split(|c: char| !c.is_alphanumeric())
+                .filter(|s| !s.is_empty())
+                .collect();
+
+            let blacklist_items = DEFAULT_BLACKLIST
+                .iter()
+                .copied()
+                .chain(self.custom_blacklist.iter().map(|s| s.as_str()));
+
+            for item in blacklist_items {
                 let stem = item.strip_suffix(".exe").unwrap_or(item);
-                if t.contains(stem) {
+                if words.contains(stem) {
                     return EvaluationResult::TriggerBarrier {
                         reason: "Blocked application matching distraction signature",
                     };
@@ -255,6 +265,90 @@ mod tests {
             source_app_id: "".to_string(),
             metadata_missing: false,
         }
+    }
+
+    #[test]
+    fn test_free_time_allows_everything() {
+        let mut engine = RulesEngine::new();
+        let win = dummy_window("steam.exe");
+        let med = dummy_media(true, "Funny cats");
+        let res = engine.evaluate(false, &win, &med, false);
+        assert_eq!(res, EvaluationResult::Allow { reason: "Free Time active (0 barriers)" });
+    }
+
+    #[test]
+    fn test_default_blacklist_triggers_barrier() {
+        let mut engine = RulesEngine::new();
+        let win = dummy_window("steam.exe");
+        let med = dummy_media(false, "");
+        let res = engine.evaluate(true, &win, &med, true);
+        assert_eq!(res, EvaluationResult::TriggerBarrier { reason: "Blacklisted distraction application active" });
+    }
+
+    #[test]
+    fn test_custom_blacklist_triggers_barrier() {
+        let mut engine = RulesEngine::new();
+        engine.custom_blacklist.insert("customgame.exe".to_string());
+        let win = dummy_window("customgame.exe");
+        let med = dummy_media(false, "");
+        let res = engine.evaluate(true, &win, &med, true);
+        assert_eq!(res, EvaluationResult::TriggerBarrier { reason: "Blacklisted distraction application active" });
+    }
+
+    #[test]
+    fn test_tactical_shield_allows_temporary_access() {
+        let mut engine = RulesEngine::new();
+        engine.grant_tactical_shield(Duration::from_secs(300));
+        let win = dummy_window("steam.exe");
+        let med = dummy_media(false, "");
+        let res = engine.evaluate(true, &win, &med, true);
+        assert_eq!(res, EvaluationResult::Allow { reason: "Tactical Shield 5-minute grace buffer active" });
+    }
+
+    #[test]
+    fn test_task_buddy_browser_window_allowed() {
+        let mut engine = RulesEngine::new();
+        let mut win = dummy_window("chrome.exe");
+        win.title = "Task Buddy - Pomodoro Focus".to_string();
+        let med = dummy_media(false, "");
+        let res = engine.evaluate(true, &win, &med, true);
+        assert_eq!(res, EvaluationResult::Allow { reason: "Task Buddy web application active" });
+    }
+
+    #[test]
+    fn test_media_misaligned_triggers_barrier() {
+        let mut engine = RulesEngine::new();
+        let win = dummy_window("chrome.exe");
+        let med = dummy_media(true, "Top 10 funny cat videos");
+        let res = engine.evaluate(true, &win, &med, false);
+        assert_eq!(res, EvaluationResult::TriggerBarrier { reason: "Media playback does not align with declared hourly task" });
+    }
+
+    #[test]
+    fn test_pause_grace_period_expiry() {
+        let mut engine = RulesEngine::new();
+        engine.was_playing = true;
+        engine.pause_started_at = Some(Instant::now() - Duration::from_secs(35));
+        let win = dummy_window("chrome.exe");
+        let mut med = dummy_media(false, "Coding music");
+        med.has_active_media = true;
+        let res = engine.evaluate(true, &win, &med, true);
+        assert_eq!(res, EvaluationResult::TriggerBarrier { reason: "Tutorial paused beyond 30-second coding grace buffer" });
+    }
+
+    #[test]
+    fn test_process_lookup_failed_word_boundary_matching() {
+        let mut engine = RulesEngine::new();
+        let mut win = dummy_window("");
+        win.lookup_failed = true;
+        win.title = "Upstreaming commit to repo".to_string();
+        let med = dummy_media(false, "");
+        let res1 = engine.evaluate(true, &win, &med, true);
+        assert_ne!(res1, EvaluationResult::TriggerBarrier { reason: "Blocked application matching distraction signature" });
+
+        win.title = "Steam Store - Special Offers".to_string();
+        let res2 = engine.evaluate(true, &win, &med, true);
+        assert_eq!(res2, EvaluationResult::TriggerBarrier { reason: "Blocked application matching distraction signature" });
     }
 
     #[test]

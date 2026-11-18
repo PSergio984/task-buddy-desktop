@@ -289,4 +289,32 @@ mod tests {
         let db = Database::new_in_memory().unwrap();
         assert!(db.update_session_end("missing_id", "2026-01-01T00:00:00Z", 100, "completed", 0).is_err());
     }
+
+    #[test]
+    fn test_seed_once_rule_deletion_persistence() {
+        let temp_dir = std::env::temp_dir().join(format!("task_buddy_test_{}", chrono::Utc::now().timestamp_millis()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let db_file = temp_dir.join("test_reopen.db");
+
+        // First open: seeds default rules
+        let db1 = Database::new(&db_file).unwrap();
+        let rules1 = db1.get_rules().unwrap();
+        assert!(!rules1.is_empty(), "Should have seeded rules");
+
+        // Delete one seeded rule (e.g. steam.exe)
+        let steam_rule = rules1.iter().find(|r| r.process_name == "steam.exe").unwrap();
+        let steam_id = steam_rule.id;
+        db1.delete_rule(steam_id).unwrap();
+        drop(db1);
+
+        // Second open: re-opens database, should NOT re-seed steam.exe
+        let db2 = Database::new(&db_file).unwrap();
+        let rules2 = db2.get_rules().unwrap();
+        assert!(
+            !rules2.iter().any(|r| r.process_name == "steam.exe"),
+            "Deleted seeded rule must remain deleted after database reopening"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
 }

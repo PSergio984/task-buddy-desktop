@@ -27,6 +27,11 @@ impl Default for MediaStatus {
     }
 }
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
+static LOGGED_REQUEST_ASYNC_ERR: AtomicBool = AtomicBool::new(false);
+static LOGGED_JOIN_ERR: AtomicBool = AtomicBool::new(false);
+
 pub fn get_current_media_status() -> MediaStatus {
     // Ensure WinRT apartment is initialized on the current thread
     unsafe {
@@ -36,17 +41,27 @@ pub fn get_current_media_status() -> MediaStatus {
     }
 
     let manager_async = match GlobalSystemMediaTransportControlsSessionManager::RequestAsync() {
-        Ok(m) => m,
+        Ok(m) => {
+            LOGGED_REQUEST_ASYNC_ERR.store(false, Ordering::Relaxed);
+            m
+        }
         Err(e) => {
-            eprintln!("[media_hook] WinRT RequestAsync failed: {e:?}");
+            if !LOGGED_REQUEST_ASYNC_ERR.swap(true, Ordering::Relaxed) {
+                eprintln!("[media_hook] WinRT RequestAsync failed (logged once): {e:?}");
+            }
             return MediaStatus::default();
         }
     };
 
     let manager = match manager_async.join() {
-        Ok(m) => m,
+        Ok(m) => {
+            LOGGED_JOIN_ERR.store(false, Ordering::Relaxed);
+            m
+        }
         Err(e) => {
-            eprintln!("[media_hook] SessionManager join failed: {e:?}");
+            if !LOGGED_JOIN_ERR.swap(true, Ordering::Relaxed) {
+                eprintln!("[media_hook] SessionManager join failed (logged once): {e:?}");
+            }
             return MediaStatus::default();
         }
     };

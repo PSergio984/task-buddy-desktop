@@ -80,6 +80,7 @@ pub fn get_active_window_info() -> ActiveWindowInfo {
     // For UWP/Store apps, top-level window may belong to ApplicationFrameHost.exe.
     // Try to resolve child CoreWindow thread process if present.
     if process_name == "applicationframehost.exe" {
+        let mut uwp_resolved = false;
         if let Ok(child_hwnd) = unsafe {
             FindWindowExW(
                 Some(hwnd),
@@ -100,11 +101,15 @@ pub fn get_active_window_info() -> ActiveWindowInfo {
                             let full_path = String::from_utf16_lossy(&path_buf[..path_len as usize]);
                             if let Some(name) = Path::new(&full_path).file_name().and_then(|n| n.to_str()) {
                                 process_name = name.to_lowercase();
+                                uwp_resolved = true;
                             }
                         }
                     }
                 }
             }
+        }
+        if !uwp_resolved {
+            lookup_failed = true;
         }
     }
 
