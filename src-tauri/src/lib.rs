@@ -1,3 +1,5 @@
+#![allow(clippy::collapsible_if)]
+
 pub mod ai;
 pub mod db;
 pub mod monitor;
