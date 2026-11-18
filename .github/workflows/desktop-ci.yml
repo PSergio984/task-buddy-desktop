@@ -2,9 +2,9 @@ name: Desktop CI
 
 on:
   push:
-    branches: [main, "feature/**"]
+    branches: [main, develop, "feat/**", "feature/**"]
   pull_request:
-    branches: [main]
+    branches: [main, develop]
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -17,12 +17,12 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
-      - name: Setup Node.js 20
-        uses: actions/setup-node@v4
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v5
         with:
-          node-version: 20
+          node-version: 22
           cache: "npm"
 
       - name: Setup Rust toolchain
@@ -50,12 +50,12 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
-      - name: Setup Node.js 20
-        uses: actions/setup-node@v4
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v5
         with:
-          node-version: 20
+          node-version: 22
           cache: "npm"
 
       - name: Setup Rust toolchain
