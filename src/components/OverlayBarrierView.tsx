@@ -16,10 +16,18 @@ interface DiversionPenaltyResult {
 export const OverlayBarrierView: React.FC = () => {
   const [holdProgress, setHoldProgress] = useState(0); // 0 to 1
   const [isHolding, setIsHolding] = useState(false);
-  const [shieldAvailable, setShieldAvailable] = useState(() => !sessionStorage.getItem("shield_spent"));
+  const [shieldAvailable, setShieldAvailable] = useState(true);
   const [penaltyFeedback, setPenaltyFeedback] = useState<string | null>(null);
   const holdStartTimeRef = useRef<number | null>(null);
   const animFrameRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    invoke<{ shield_spent: boolean }>("get_session_status")
+      .then((sess) => {
+        setShieldAvailable(!sess.shield_spent);
+      })
+      .catch(console.error);
+  }, []);
 
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
@@ -82,14 +90,17 @@ export const OverlayBarrierView: React.FC = () => {
         setPenaltyFeedback(
           `⚠️ Focus Broken: -${penalty.hp_lost} HP (${penalty.damage_mitigated} HP absorbed by gear)`
         );
-        setTimeout(() => {
-          invoke("dismiss_barrier").catch(console.error);
+        setTimeout(async () => {
+          await invoke("dismiss_overlay_window");
+          await invoke("dismiss_barrier");
         }, 1200);
       } else {
+        await invoke("dismiss_overlay_window");
         await invoke("dismiss_barrier");
       }
     } catch (err) {
       console.error("Failed to record bypass penalty:", err);
+      await invoke("dismiss_overlay_window");
       await invoke("dismiss_barrier");
     }
   };
@@ -97,12 +108,14 @@ export const OverlayBarrierView: React.FC = () => {
   const activate5mAllowance = async () => {
     try {
       if (shieldAvailable) {
-        sessionStorage.setItem("shield_spent", "true");
+        await invoke("activate_tactical_shield");
         setShieldAvailable(false);
+      } else {
+        await invoke("dismiss_barrier");
       }
-      await invoke("dismiss_barrier");
     } catch (err) {
-      console.error("Failed to dismiss barrier for allowance:", err);
+      console.error("Failed to activate tactical shield:", err);
+      await invoke("dismiss_barrier");
     }
   };
 

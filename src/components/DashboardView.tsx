@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useState, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { Play, Square, Shield, Clock, Zap, Laptop, Activity, Music, Plus, Trash2, ListFilter, Cloud, Sparkles, Pin, PinOff, Eye } from "lucide-react";
@@ -94,11 +94,18 @@ export const DashboardView: React.FC = () => {
     }
   };
 
+  const authTokenRef = useRef(authToken);
+  authTokenRef.current = authToken;
+  const hudPinnedRef = useRef(hudPinned);
+  hudPinnedRef.current = hudPinned;
+
   const triggerHudGlance = () => {
     setShowHud(true);
-    if (!hudPinned) {
+    if (!hudPinnedRef.current) {
       setTimeout(() => {
-        setShowHud(false);
+        if (!hudPinnedRef.current) {
+          setShowHud(false);
+        }
       }, 2500);
     }
   };
@@ -108,10 +115,10 @@ export const DashboardView: React.FC = () => {
     localStorage.setItem("backend_auth_token", token);
   };
 
+  // Static event listeners setup (runs once on mount)
   useEffect(() => {
     refreshStatus();
     refreshRules();
-    syncRemote();
 
     const savedGroqKey = localStorage.getItem("groq_api_key");
     if (savedGroqKey) {
@@ -119,7 +126,6 @@ export const DashboardView: React.FC = () => {
     }
 
     const interval = setInterval(pollOsInfo, 1500);
-    const syncInterval = setInterval(syncRemote, 10000);
 
     const unlistenSessionPromise = listen<SessionState>("session-changed", (event) => {
       setSession(event.payload);
@@ -140,12 +146,82 @@ export const DashboardView: React.FC = () => {
 
     return () => {
       clearInterval(interval);
-      clearInterval(syncInterval);
       window.removeEventListener("keydown", handleKeyDown);
       unlistenSessionPromise.then((unlisten) => unlisten());
       unlistenHudPromise.then((unlisten) => unlisten());
     };
-  }, [authToken, hudPinned]);
+  }, []);
+
+  // Dynamic Focus Session Countdown Ticker
+  useEffect(() => {
+    if (!session.is_focus_active) return;
+    const ticker = setInterval(() => {
+      setSession((prev) => ({
+        ...prev,
+        elapsed_seconds: (prev.elapsed_seconds || 0) + 1,
+      }));
+    }, 1000);
+    return () => clearInterval(ticker);
+  }, [session.is_focus_active]);
+
+  // Persistent Server-Sent Events (SSE) Push Synchronization Stream
+  useEffect(() => {
+    if (!authToken || !authToken.trim()) return;
+
+    syncRemote();
+    const controller = new AbortController();
+    let isCancelled = false;
+
+    const connectSse = async () => {
+      try {
+        const response = await fetch("http://localhost:8000/api/v1/game/sessions/stream", {
+          headers: {
+            Authorization: `Bearer ${authToken.trim()}`,
+          },
+          signal: controller.signal,
+        });
+
+        if (!response.ok || !response.body) {
+          return;
+        }
+
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder("utf-8");
+        let buffer = "";
+
+        while (!isCancelled) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split("\n\n");
+          buffer = lines.pop() || "";
+
+          for (const chunk of lines) {
+            for (const line of chunk.split("\n")) {
+              if (line.startsWith("data:")) {
+                try {
+                  await invoke("sync_remote_session", { token: authToken.trim() });
+                } catch {
+                  // Silent decode parse
+                }
+              }
+            }
+          }
+        }
+      } catch (err: any) {
+        if (err.name !== "AbortError" && !isCancelled) {
+          setTimeout(connectSse, 5000);
+        }
+      }
+    };
+
+    connectSse();
+
+    return () => {
+      isCancelled = true;
+      controller.abort();
+    };
+  }, [authToken]);
 
   const handleGroqKeyChange = async (key: string) => {
     setGroqApiKey(key);
@@ -212,6 +288,12 @@ export const DashboardView: React.FC = () => {
     }
   };
 
+  const totalSec = (session.duration_minutes || 25) * 60;
+  const remSec = Math.max(0, totalSec - (session.elapsed_seconds || 0));
+  const remMin = Math.floor(remSec / 60);
+  const remSecMod = remSec % 60;
+  const displayRemaining = `${remMin}:${remSecMod.toString().padStart(2, "0")}`;
+
   return (
     <div className="flex flex-col h-screen w-full bg-slate-950 text-slate-100 select-none">
       {/* Top Header */}
@@ -258,7 +340,7 @@ export const DashboardView: React.FC = () => {
       {(showHud || hudPinned) && (
         <div className="mx-5 mt-3 p-3 rounded-xl bg-purple-950/80 border border-purple-500/40 backdrop-blur-md shadow-lg flex items-center justify-between text-xs animate-in fade-in slide-in-from-top duration-200">
           <div className="flex items-center gap-2.5">
-            <div className="p-1 rounded-md bg-purple-500/20 text-purple-300">
+            <div className="p-1.5 rounded-md bg-purple-500/20 text-purple-300">
               <Eye className="w-3.5 h-3.5" />
             </div>
             <div>
@@ -272,7 +354,7 @@ export const DashboardView: React.FC = () => {
           </div>
           <div className="flex items-center gap-2">
             <span className="font-mono text-purple-200 text-xs font-semibold px-2 py-0.5 rounded bg-purple-900/60 border border-purple-700/50">
-              {session.duration_minutes}:00
+              {displayRemaining}
             </span>
             <button
               onClick={() => setHudPinned(!hudPinned)}

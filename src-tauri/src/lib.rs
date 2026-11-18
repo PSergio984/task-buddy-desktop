@@ -11,6 +11,7 @@ use tauri::{
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
     AppHandle, Emitter, Manager, State,
 };
+use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState};
 
 #[derive(Default, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SessionState {
@@ -22,6 +23,8 @@ pub struct SessionState {
     pub elapsed_seconds: u32,
     pub is_overlay_visible: bool,
     pub backend_token: Option<String>,
+    pub shield_spent: bool,
+    pub tactical_shield_until: Option<i64>,
 }
 
 pub struct AppState {
@@ -230,7 +233,7 @@ fn dismiss_barrier(app: AppHandle, state: State<'_, AppState>) -> Result<(), Str
 
 #[tauri::command]
 async fn record_barrier_bypass(
-    app: AppHandle,
+    _app: AppHandle,
     state: State<'_, AppState>,
     token: Option<String>,
     reason: Option<String>,
@@ -256,10 +259,6 @@ async fn record_barrier_bypass(
     };
     let _ = state.db.record_diversion(&div_record);
 
-    if let Some(overlay) = app.get_webview_window("overlay") {
-        let _ = overlay.hide();
-    }
-
     if let Some(tok) = auth_token {
         if !tok.trim().is_empty() {
             let res = state
@@ -276,6 +275,31 @@ async fn record_barrier_bypass(
     }
 
     Ok(None)
+}
+
+#[tauri::command]
+fn dismiss_overlay_window(app: AppHandle) -> Result<(), String> {
+    if let Some(overlay) = app.get_webview_window("overlay") {
+        let _ = overlay.hide();
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn activate_tactical_shield(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+    let mut session = state.session.lock().unwrap();
+    let until = Utc::now().timestamp_millis() + 300_000;
+    session.tactical_shield_until = Some(until);
+    session.shield_spent = true;
+    session.is_overlay_visible = false;
+    let snapshot = session.clone();
+    drop(session);
+
+    if let Some(overlay) = app.get_webview_window("overlay") {
+        let _ = overlay.hide();
+    }
+    let _ = app.emit("session-changed", &snapshot);
+    Ok(())
 }
 
 #[tauri::command]
@@ -298,17 +322,27 @@ async fn sync_remote_session(
         session.backend_token = Some(token.clone());
 
         if remote.is_active {
+            let mut changed = false;
             if let Some(ref phase) = remote.current_phase {
                 let should_be_active = phase.kind == "focus" && phase.status == "active";
                 if session.is_focus_active != should_be_active {
                     session.is_focus_active = should_be_active;
-                    if let Some(ref label) = remote.activity_label {
-                        session.task_title = label.clone();
-                    }
-                    session.remote_session_id = remote.session_id;
-                    let snapshot = session.clone();
-                    let _ = app.emit("session-changed", &snapshot);
+                    changed = true;
                 }
+            }
+            if let Some(ref label) = remote.activity_label {
+                if session.task_title != *label {
+                    session.task_title = label.clone();
+                    changed = true;
+                }
+            }
+            if session.remote_session_id != remote.session_id {
+                session.remote_session_id = remote.session_id;
+                changed = true;
+            }
+            if changed {
+                let snapshot = session.clone();
+                let _ = app.emit("session-changed", &snapshot);
             }
         } else if session.is_focus_active {
             // Remote session ended -> drop to Free Time
@@ -327,6 +361,9 @@ async fn sync_remote_session(
 
 #[tauri::command]
 fn toggle_task_hud(app: AppHandle) -> Result<(), String> {
+    if let Some(main) = app.get_webview_window("main") {
+        let _ = main.show();
+    }
     let _ = app.emit("toggle-task-hud", ());
     Ok(())
 }
@@ -349,6 +386,18 @@ pub fn run() {
 
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(
+            tauri_plugin_global_shortcut::Builder::new()
+                .with_handler(|app, _shortcut, event| {
+                    if event.state() == ShortcutState::Pressed {
+                        if let Some(main) = app.get_webview_window("main") {
+                            let _ = main.show();
+                        }
+                        let _ = app.emit("toggle-task-hud", ());
+                    }
+                })
+                .build(),
+        )
         .manage(app_state)
         .invoke_handler(tauri::generate_handler![
             get_session_status,
@@ -364,10 +413,17 @@ pub fn run() {
             trigger_barrier,
             dismiss_barrier,
             record_barrier_bypass,
+            dismiss_overlay_window,
+            activate_tactical_shield,
             sync_remote_session,
             toggle_task_hud,
         ])
         .setup(move |app| {
+            // Register global hotkey Ctrl+Alt+Space for instant task glance HUD
+            if let Ok(shortcut) = "ctrl+alt+space".parse::<Shortcut>() {
+                let _ = app.global_shortcut().register(shortcut);
+            }
+
             // Spawn Background OS Monitor Thread with dynamic SQLite rules and AI matcher
             let monitor_handle = app.handle().clone();
             let monitor_session = session_ref.clone();
@@ -394,10 +450,17 @@ pub fn run() {
                         last_rules_update = std::time::Instant::now();
                     }
 
-                    let (is_focus_active, active_task_title) = {
+                    let (is_focus_active, active_task_title, shield_until) = {
                         let lock = monitor_session.lock().unwrap();
-                        (lock.is_focus_active, lock.task_title.clone())
+                        (lock.is_focus_active, lock.task_title.clone(), lock.tactical_shield_until)
                     };
+
+                    if let Some(until) = shield_until {
+                        let now_ms = Utc::now().timestamp_millis();
+                        if now_ms < until {
+                            rules.grant_tactical_shield(Duration::from_millis((until - now_ms) as u64));
+                        }
+                    }
 
                     let window = monitor::get_active_window_info();
                     let media = monitor::get_current_media_status();

@@ -36,6 +36,7 @@ pub struct RulesEngine {
     pub was_playing: bool,
     pub custom_whitelist: HashSet<String>,
     pub custom_blacklist: HashSet<String>,
+    pub shield_grace_until: Option<Instant>,
 }
 
 impl Default for RulesEngine {
@@ -45,6 +46,7 @@ impl Default for RulesEngine {
             was_playing: false,
             custom_whitelist: HashSet::new(),
             custom_blacklist: HashSet::new(),
+            shield_grace_until: None,
         }
     }
 }
@@ -52,6 +54,10 @@ impl Default for RulesEngine {
 impl RulesEngine {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn grant_tactical_shield(&mut self, duration: Duration) {
+        self.shield_grace_until = Some(Instant::now() + duration);
     }
 
     pub fn update_rules(&mut self, rules: &[crate::db::ProcessRule]) {
@@ -86,6 +92,17 @@ impl RulesEngine {
             return EvaluationResult::Allow {
                 reason: "Free Time active (0 barriers)",
             };
+        }
+
+        // Tactical Shield grace buffer (e.g. 5 minutes) grants temporary immunity
+        if let Some(until) = self.shield_grace_until {
+            if Instant::now() < until {
+                return EvaluationResult::Allow {
+                    reason: "Tactical Shield 5-minute grace buffer active",
+                };
+            } else {
+                self.shield_grace_until = None;
+            }
         }
 
         let proc = window.process_name.to_lowercase();
@@ -253,6 +270,23 @@ mod tests {
                 reason: "Task Buddy web application whitelisted"
             }
         );
+    }
+
+    #[test]
+    fn test_tactical_shield_grace_buffer_allows() {
+        let mut engine = RulesEngine::new();
+        let win = dummy_window("chrome.exe");
+        let med = dummy_media(false, "");
+        // Without shield, paused tutorial beyond buffer triggers barrier
+        engine.was_playing = true;
+        engine.pause_started_at = Some(Instant::now() - Duration::from_secs(35));
+        let res1 = engine.evaluate(true, &win, &med, true);
+        assert_eq!(res1, EvaluationResult::TriggerBarrier { reason: "Tutorial paused beyond 30-second coding grace buffer" });
+
+        // Grant 5m tactical shield -> now allows
+        engine.grant_tactical_shield(Duration::from_secs(300));
+        let res2 = engine.evaluate(true, &win, &med, true);
+        assert_eq!(res2, EvaluationResult::Allow { reason: "Tactical Shield 5-minute grace buffer active" });
     }
 }
 

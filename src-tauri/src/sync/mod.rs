@@ -27,7 +27,10 @@ impl Default for BackendSyncClient {
     fn default() -> Self {
         Self {
             base_url: "http://localhost:8000/api/v1".to_string(),
-            client: reqwest::Client::new(),
+            client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(10))
+                .build()
+                .unwrap_or_default(),
         }
     }
 }
@@ -36,7 +39,10 @@ impl BackendSyncClient {
     pub fn new(base_url: &str) -> Self {
         Self {
             base_url: base_url.trim_end_matches('/').to_string(),
-            client: reqwest::Client::new(),
+            client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(10))
+                .build()
+                .unwrap_or_default(),
         }
     }
 
@@ -158,6 +164,10 @@ impl BackendSyncClient {
             .map_err(|e| format!("Network error: {}", e))?;
 
         if !res.status().is_success() {
+            let status = res.status();
+            if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+                return Err(format!("Backend auth expired or invalid: {}", status));
+            }
             return Ok(None);
         }
 
