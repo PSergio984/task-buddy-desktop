@@ -10,9 +10,29 @@ use std::time::Duration;
 use tauri::{
     menu::{MenuBuilder, MenuItem, PredefinedMenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    AppHandle, Emitter, Manager, State,
+    AppHandle, Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder,
 };
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState};
+
+fn show_all_overlays(app: &AppHandle) {
+    if let Some(overlay) = app.get_webview_window("overlay") {
+        let _ = overlay.show();
+        let _ = overlay.set_focus();
+    }
+    for (label, window) in app.webview_windows() {
+        if label.starts_with("overlay_") {
+            let _ = window.show();
+        }
+    }
+}
+
+fn hide_all_overlays(app: &AppHandle) {
+    for (label, window) in app.webview_windows() {
+        if label.starts_with("overlay") {
+            let _ = window.hide();
+        }
+    }
+}
 
 #[derive(Default, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SessionState {
@@ -235,9 +255,7 @@ fn internal_end_session(app: &AppHandle, state: &AppState) -> SessionState {
         }
     }
 
-    if let Some(overlay) = app.get_webview_window("overlay") {
-        let _ = overlay.hide();
-    }
+    hide_all_overlays(app);
 
     let snapshot = session.clone();
     drop(session);
@@ -302,10 +320,7 @@ fn trigger_barrier(app: AppHandle, state: State<'_, AppState>) -> Result<(), Str
     let mut session = state.session.lock().unwrap();
     session.is_overlay_visible = true;
 
-    if let Some(overlay) = app.get_webview_window("overlay") {
-        let _ = overlay.show();
-        let _ = overlay.set_focus();
-    }
+    show_all_overlays(&app);
 
     let snapshot = session.clone();
     let _ = app.emit("session-changed", &snapshot);
@@ -337,9 +352,7 @@ fn dismiss_barrier(app: AppHandle, state: State<'_, AppState>) -> Result<(), Str
         .unwrap()
         .grant_bypass_grace(Duration::from_secs(60));
 
-    if let Some(overlay) = app.get_webview_window("overlay") {
-        let _ = overlay.hide();
-    }
+    hide_all_overlays(&app);
 
     let snapshot = session.clone();
     let _ = app.emit("session-changed", &snapshot);
@@ -416,9 +429,7 @@ async fn record_barrier_bypass(
 
 #[tauri::command]
 fn dismiss_overlay_window(app: AppHandle) -> Result<(), String> {
-    if let Some(overlay) = app.get_webview_window("overlay") {
-        let _ = overlay.hide();
-    }
+    hide_all_overlays(&app);
     Ok(())
 }
 
@@ -436,9 +447,7 @@ fn activate_tactical_shield(app: AppHandle, state: State<'_, AppState>) -> Resul
     let snapshot = session.clone();
     drop(session);
 
-    if let Some(overlay) = app.get_webview_window("overlay") {
-        let _ = overlay.hide();
-    }
+    hide_all_overlays(&app);
     let _ = app.emit("session-changed", &snapshot);
     Ok(())
 }
@@ -487,9 +496,7 @@ async fn sync_remote_session(
                             session.elapsed_seconds += instant.elapsed().as_secs() as u32;
                         }
                         session.is_overlay_visible = false;
-                        if let Some(overlay) = app.get_webview_window("overlay") {
-                            let _ = overlay.hide();
-                        }
+                        hide_all_overlays(&app);
                     } else {
                         // Resumed focus
                         session.started_at_instant = Some(std::time::Instant::now());
@@ -596,9 +603,7 @@ async fn sync_remote_session(
             session.remote_session_id = None;
             let _ = state.db.update_session_end(&sess_id, &ended_at, actual_sec, "completed", div_count);
 
-            if let Some(overlay) = app.get_webview_window("overlay") {
-                let _ = overlay.hide();
-            }
+            hide_all_overlays(&app);
             let snapshot = session.clone();
             let _ = app.emit("session-changed", &snapshot);
         }
@@ -662,6 +667,23 @@ pub fn run() {
             if let Ok(shortcut) = "ctrl+alt+space".parse::<Shortcut>() {
                 if let Err(e) = app.global_shortcut().register(shortcut) {
                     eprintln!("[shortcut] Failed to register Ctrl+Alt+Space: {e:?}");
+                }
+            }
+
+            // Spawn secondary overlays for additional connected monitors
+            if let Ok(monitors) = app.available_monitors() {
+                for (idx, monitor) in monitors.iter().enumerate().skip(1) {
+                    let label = format!("overlay_{}", idx);
+                    let _ = WebviewWindowBuilder::new(app, &label, WebviewUrl::App("index.html".into()))
+                        .title(format!("Task Buddy Barrier - Monitor {}", idx + 1))
+                        .transparent(true)
+                        .decorations(false)
+                        .always_on_top(true)
+                        .visible(false)
+                        .skip_taskbar(true)
+                        .position(monitor.position().x as f64, monitor.position().y as f64)
+                        .fullscreen(true)
+                        .build();
                 }
             }
 
@@ -740,11 +762,8 @@ pub fn run() {
                             }
                         }
                         if trigger_overlay {
-                            // Synchronize overlay presentation after dropping session lock to prevent deadlock
-                            if let Some(overlay) = monitor_handle.get_webview_window("overlay") {
-                                let _ = overlay.show();
-                                let _ = overlay.set_focus();
-                            }
+                            // Synchronize overlay presentation across all monitors after dropping session lock to prevent deadlock
+                            show_all_overlays(&monitor_handle);
                             if let Some(sess_id) = sess_id_opt {
                                 let div = db::DiversionEventRecord {
                                     id: format!("div_{}", Utc::now().timestamp_millis()),
@@ -838,13 +857,14 @@ pub fn run() {
                         let _ = internal_end_session(app, &state);
                     }
                     "toggle_overlay" => {
-                        if let Some(overlay) = app.get_webview_window("overlay") {
-                            if overlay.is_visible().unwrap_or(false) {
-                                let _ = overlay.hide();
-                            } else {
-                                let _ = overlay.show();
-                                let _ = overlay.set_focus();
-                            }
+                        let is_visible = app
+                            .get_webview_window("overlay")
+                            .and_then(|o| o.is_visible().ok())
+                            .unwrap_or(false);
+                        if is_visible {
+                            hide_all_overlays(app);
+                        } else {
+                            show_all_overlays(app);
                         }
                     }
                     "show_main" => {

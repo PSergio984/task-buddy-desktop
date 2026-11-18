@@ -14,7 +14,11 @@ interface DiversionPenaltyResult {
   died: boolean;
 }
 
-export const OverlayBarrierView: React.FC = () => {
+interface OverlayBarrierViewProps {
+  isSecondary?: boolean;
+}
+
+export const OverlayBarrierView: React.FC<OverlayBarrierViewProps> = ({ isSecondary = false }) => {
   const [holdProgress, setHoldProgress] = useState(0); // 0 to 1
   const [isHolding, setIsHolding] = useState(false);
   const [shieldAvailable, setShieldAvailable] = useState(true);
@@ -157,6 +161,29 @@ export const OverlayBarrierView: React.FC = () => {
   const radius = 64;
   const circumference = 2 * Math.PI * radius;
   const strokeDashoffset = circumference - holdProgress * circumference;
+
+  if (isSecondary) {
+    return (
+      <div className="fixed inset-0 z-50 flex flex-col items-center justify-center bg-black/85 backdrop-blur-2xl text-slate-100 select-none p-8">
+        <div className="flex items-center gap-2 px-4 py-2 rounded-full bg-amber-500/10 border border-amber-500/20 text-amber-400 text-sm font-medium mb-8 animate-pulse">
+          <ShieldAlert className="w-4 h-4" />
+          <span>Focus Session Active • Secondary Display Locked</span>
+        </div>
+        <div className="max-w-md w-full text-center flex flex-col items-center">
+          <h1 className="text-3xl font-bold tracking-tight text-white mb-2">
+            Barrier Active
+          </h1>
+          <p className="text-slate-400 text-sm mb-6 leading-relaxed">
+            All secondary monitors are locked during an active diversion. Use the 6-second hold dial on your primary screen to re-align or bypass.
+          </p>
+          <div className="p-4 rounded-xl bg-slate-900/80 border border-slate-800 text-slate-300 text-xs flex items-center gap-3">
+            <ShieldCheck className="w-5 h-5 text-amber-400 shrink-0" />
+            <span>Primary monitor has the interactive bypass dial and tactical shield.</span>
+          </div>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="fixed inset-0 z-50 flex flex-col items-center justify-center bg-black/85 backdrop-blur-2xl text-slate-100 select-none p-8">

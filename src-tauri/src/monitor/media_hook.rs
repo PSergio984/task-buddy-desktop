@@ -4,7 +4,7 @@ use windows::Media::Control::{
     GlobalSystemMediaTransportControlsSessionPlaybackStatus,
 };
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct MediaStatus {
     pub has_active_media: bool,
     pub is_playing: bool,
@@ -12,19 +12,6 @@ pub struct MediaStatus {
     pub artist: String,
     pub source_app_id: String,
     pub metadata_missing: bool,
-}
-
-impl Default for MediaStatus {
-    fn default() -> Self {
-        Self {
-            has_active_media: false,
-            is_playing: false,
-            title: String::new(),
-            artist: String::new(),
-            source_app_id: String::new(),
-            metadata_missing: false,
-        }
-    }
 }
 
 use std::sync::atomic::{AtomicBool, Ordering};

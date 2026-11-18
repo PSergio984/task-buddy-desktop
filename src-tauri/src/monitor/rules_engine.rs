@@ -31,6 +31,7 @@ pub enum EvaluationResult {
     TriggerBarrier { reason: &'static str },
 }
 
+#[derive(Default)]
 pub struct RulesEngine {
     pub pause_started_at: Option<Instant>,
     pub was_playing: bool,
@@ -38,19 +39,6 @@ pub struct RulesEngine {
     pub custom_blacklist: HashSet<String>,
     pub shield_grace_until: Option<Instant>,
     pub bypass_grace_until: Option<Instant>,
-}
-
-impl Default for RulesEngine {
-    fn default() -> Self {
-        Self {
-            pause_started_at: None,
-            was_playing: false,
-            custom_whitelist: HashSet::new(),
-            custom_blacklist: HashSet::new(),
-            shield_grace_until: None,
-            bypass_grace_until: None,
-        }
-    }
 }
 
 impl RulesEngine {

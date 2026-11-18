@@ -16,8 +16,9 @@ function getInitialWindowLabel(): string {
 export function App() {
   const [windowLabel] = useState<string>(getInitialWindowLabel);
 
-  if (windowLabel === "overlay") {
-    return <OverlayBarrierView />;
+  if (windowLabel.startsWith("overlay")) {
+    const isSecondary = windowLabel !== "overlay";
+    return <OverlayBarrierView isSecondary={isSecondary} />;
   }
 
   return <DashboardView />;
