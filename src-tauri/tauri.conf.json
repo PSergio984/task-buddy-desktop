@@ -44,5 +44,13 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ]
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDM5N0IyMjk1MjAxOTUxRkYKUldUL1VSa2dsU0o3T2YrUzJZS0NNQU93UUxMU1lhb2d6RC82Tnp1MXFjajNPWW9DMXpPRGNUb0UK",
+      "endpoints": [
+        "https://github.com/PSergio984/task-buddy-desktop/releases/latest/download/latest.json"
+      ]
+    }
   }
 }

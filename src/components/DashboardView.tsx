@@ -1,7 +1,8 @@
 import { useEffect, useState, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { Play, Square, Shield, Clock, Zap, Laptop, Activity, Music, Plus, Trash2, ListFilter, Cloud, Sparkles, Pin, PinOff, Eye } from "lucide-react";
+import { check } from "@tauri-apps/plugin-updater";
+import { Play, Square, Shield, Clock, Zap, Laptop, Activity, Music, Plus, Trash2, ListFilter, Cloud, Sparkles, Pin, PinOff, Eye, RefreshCw, CheckCircle2, Download } from "lucide-react";
 
 interface SessionState {
   is_focus_active: boolean;
@@ -53,11 +54,50 @@ export const DashboardView: React.FC = () => {
   const [hudPinned, setHudPinned] = useState(false);
   const [isStartingSession, setIsStartingSession] = useState(false);
   const [sseStatus, setSseStatus] = useState<"idle" | "connecting" | "connected" | "error" | "auth_error">("idle");
+  const [updateStatus, setUpdateStatus] = useState<"idle" | "checking" | "available" | "downloading" | "upToDate" | "error">("idle");
+  const [updateMessage, setUpdateMessage] = useState<string | null>(null);
 
   const [osInfo, setOsInfo] = useState<{ window: ActiveWindowInfo; media: MediaStatus }>({
     window: { title: "", process_name: "", is_empty: true },
     media: { has_active_media: false, is_playing: false, title: "", artist: "", source_app_id: "" },
   });
+
+  const handleCheckForUpdates = async () => {
+    try {
+      setUpdateStatus("checking");
+      setUpdateMessage("Checking for updates on GitHub...");
+      const update = await check();
+      if (update) {
+        setUpdateStatus("available");
+        setUpdateMessage(`New version v${update.version} available!`);
+      } else {
+        setUpdateStatus("upToDate");
+        setUpdateMessage("You are running the latest version.");
+        setTimeout(() => setUpdateStatus("idle"), 4000);
+      }
+    } catch (err: any) {
+      console.error("Update check failed:", err);
+      setUpdateStatus("error");
+      setUpdateMessage(`Check failed: ${err?.message || err}`);
+      setTimeout(() => setUpdateStatus("idle"), 5000);
+    }
+  };
+
+  const handleInstallUpdate = async () => {
+    try {
+      setUpdateStatus("downloading");
+      setUpdateMessage("Downloading and applying update package...");
+      const update = await check();
+      if (update) {
+        await update.downloadAndInstall();
+        setUpdateMessage("Update installed! Restarting app...");
+      }
+    } catch (err: any) {
+      console.error("Failed to install update:", err);
+      setUpdateStatus("error");
+      setUpdateMessage(`Install failed: ${err?.message || err}`);
+    }
+  };
 
   const refreshStatus = async () => {
     try {
@@ -412,6 +452,17 @@ export const DashboardView: React.FC = () => {
             <Eye className="w-3 h-3 text-purple-400" />
             <span>Ctrl+Alt+Space</span>
           </button>
+
+          <button
+            onClick={handleCheckForUpdates}
+            disabled={updateStatus === "checking" || updateStatus === "downloading"}
+            title="Check GitHub Releases for app updates"
+            className="text-[10px] text-slate-400 hover:text-slate-200 bg-slate-800/80 hover:bg-slate-800 px-2 py-1 rounded border border-slate-700/60 transition-colors flex items-center gap-1 cursor-pointer disabled:opacity-50"
+          >
+            <RefreshCw className={`w-3 h-3 text-cyan-400 ${updateStatus === "checking" ? "animate-spin" : ""}`} />
+            <span>{updateStatus === "checking" ? "Checking..." : "Updates"}</span>
+          </button>
+
           <span
             className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium border ${
               session.is_focus_active
@@ -428,6 +479,43 @@ export const DashboardView: React.FC = () => {
           </span>
         </div>
       </header>
+
+      {/* In-App Update Alert Notification */}
+      {updateStatus !== "idle" && (
+        <div className={`mx-5 mt-2.5 p-2.5 rounded-xl border flex items-center justify-between text-xs transition-all ${
+          updateStatus === "available"
+            ? "bg-cyan-950/90 border-cyan-500/40 text-cyan-200"
+            : updateStatus === "downloading"
+            ? "bg-indigo-950/90 border-indigo-500/40 text-indigo-200 animate-pulse"
+            : updateStatus === "upToDate"
+            ? "bg-emerald-950/80 border-emerald-500/30 text-emerald-300"
+            : updateStatus === "error"
+            ? "bg-red-950/80 border-red-500/30 text-red-300"
+            : "bg-slate-900 border-slate-800 text-slate-300"
+        }`}>
+          <div className="flex items-center gap-2">
+            {updateStatus === "available" ? (
+              <Download className="w-4 h-4 text-cyan-400 animate-bounce" />
+            ) : updateStatus === "upToDate" ? (
+              <CheckCircle2 className="w-4 h-4 text-emerald-400" />
+            ) : updateStatus === "checking" || updateStatus === "downloading" ? (
+              <RefreshCw className="w-4 h-4 text-cyan-400 animate-spin" />
+            ) : (
+              <Zap className="w-4 h-4 text-amber-400" />
+            )}
+            <span>{updateMessage}</span>
+          </div>
+
+          {updateStatus === "available" && (
+            <button
+              onClick={handleInstallUpdate}
+              className="px-2.5 py-1 rounded bg-cyan-600 hover:bg-cyan-500 text-white font-medium text-[11px] shadow transition-colors cursor-pointer"
+            >
+              Update Now
+            </button>
+          )}
+        </div>
+      )}
 
       {/* Ambient Task Glance HUD (Ctrl+Alt+Space) */}
       {(showHud || hudPinned) && (
