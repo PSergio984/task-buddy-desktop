@@ -41,6 +41,9 @@ export const OverlayBarrierView: React.FC = () => {
     };
   }, []);
 
+  const isHoldingRef = useRef(false);
+  isHoldingRef.current = isHolding;
+
   useEffect(() => {
     const isControlElement = (el: HTMLElement | null) => {
       if (!el) return false;
@@ -56,7 +59,7 @@ export const OverlayBarrierView: React.FC = () => {
       if (isControlElement(e.target as HTMLElement | null)) {
         return;
       }
-      if (e.code === "Space" && !e.repeat && !isHolding) {
+      if (e.code === "Space" && !e.repeat && !isHoldingRef.current) {
         e.preventDefault();
         startHold();
       }
@@ -66,7 +69,7 @@ export const OverlayBarrierView: React.FC = () => {
       if (isControlElement(e.target as HTMLElement | null)) {
         return;
       }
-      if (e.code === "Space") {
+      if (e.code === "Space" && isHoldingRef.current) {
         e.preventDefault();
         cancelHold();
       }
@@ -78,7 +81,7 @@ export const OverlayBarrierView: React.FC = () => {
       window.removeEventListener("keydown", handleKeyDown);
       window.removeEventListener("keyup", handleKeyUp);
     };
-  }, [isHolding]);
+  }, []);
 
   // Cancel any running animation frame only on unmount
   useEffect(() => {

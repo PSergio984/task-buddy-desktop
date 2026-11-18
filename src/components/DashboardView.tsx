@@ -51,6 +51,8 @@ export const DashboardView: React.FC = () => {
   const [activeTab, setActiveTab] = useState<"focus" | "rules">("focus");
   const [showHud, setShowHud] = useState(false);
   const [hudPinned, setHudPinned] = useState(false);
+  const [isStartingSession, setIsStartingSession] = useState(false);
+  const [sseStatus, setSseStatus] = useState<"idle" | "connecting" | "connected" | "error" | "auth_error">("idle");
 
   const [osInfo, setOsInfo] = useState<{ window: ActiveWindowInfo; media: MediaStatus }>({
     window: { title: "", process_name: "", is_empty: true },
@@ -106,11 +108,16 @@ export const DashboardView: React.FC = () => {
   authTokenRef.current = committedToken;
   const hudPinnedRef = useRef(hudPinned);
   hudPinnedRef.current = hudPinned;
+  const glanceTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const triggerHudGlance = () => {
     setShowHud(true);
+    if (glanceTimeoutRef.current) {
+      clearTimeout(glanceTimeoutRef.current);
+      glanceTimeoutRef.current = null;
+    }
     if (!hudPinnedRef.current) {
-      setTimeout(() => {
+      glanceTimeoutRef.current = setTimeout(() => {
         if (!hudPinnedRef.current) {
           setShowHud(false);
         }
@@ -159,6 +166,9 @@ export const DashboardView: React.FC = () => {
 
     return () => {
       clearInterval(interval);
+      if (glanceTimeoutRef.current) {
+        clearTimeout(glanceTimeoutRef.current);
+      }
       window.removeEventListener("keydown", handleKeyDown);
       unlistenSessionPromise.then((unlisten) => unlisten());
       unlistenHudPromise.then((unlisten) => unlisten());
@@ -179,13 +189,19 @@ export const DashboardView: React.FC = () => {
 
   // Persistent Server-Sent Events (SSE) Push Synchronization Stream
   useEffect(() => {
-    if (!committedToken || !committedToken.trim()) return;
+    if (!committedToken || !committedToken.trim()) {
+      setSseStatus("idle");
+      return;
+    }
 
     syncRemote();
     const controller = new AbortController();
     let isCancelled = false;
+    let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 
     const connectSse = async () => {
+      if (isCancelled) return;
+      setSseStatus("connecting");
       try {
         const response = await fetch("http://localhost:8000/api/v1/game/sessions/stream", {
           headers: {
@@ -194,11 +210,20 @@ export const DashboardView: React.FC = () => {
           signal: controller.signal,
         });
 
+        if (response.status === 401 || response.status === 403) {
+          setSseStatus("auth_error");
+          return; // Non-retryable authentication failure
+        }
+
         if (!response.ok || !response.body) {
-          if (!isCancelled) setTimeout(connectSse, 5000);
+          setSseStatus("error");
+          if (!isCancelled) {
+            reconnectTimer = setTimeout(connectSse, 5000);
+          }
           return;
         }
 
+        setSseStatus("connected");
         const reader = response.body.getReader();
         const decoder = new TextDecoder("utf-8");
         let buffer = "";
@@ -207,8 +232,18 @@ export const DashboardView: React.FC = () => {
           const { done, value } = await reader.read();
           if (done) break;
           buffer += decoder.decode(value, { stream: true });
-          const lines = buffer.split("\n\n");
-          buffer = lines.pop() || "";
+
+          // Retain trailing \r in case next chunk delivers \n
+          let toProcess = buffer;
+          let leftover = "";
+          if (toProcess.endsWith("\r")) {
+            toProcess = toProcess.slice(0, -1);
+            leftover = "\r";
+          }
+          // Normalize CRLF (\r\n) and bare CR (\r) into standard \n
+          const normalized = toProcess.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+          const lines = normalized.split("\n\n");
+          buffer = (lines.pop() || "") + leftover;
 
           for (const chunk of lines) {
             for (const line of chunk.split("\n")) {
@@ -231,11 +266,13 @@ export const DashboardView: React.FC = () => {
           }
         }
         if (!isCancelled) {
-          setTimeout(connectSse, 3000);
+          setSseStatus("connecting");
+          reconnectTimer = setTimeout(connectSse, 3000);
         }
       } catch (err: any) {
         if (err.name !== "AbortError" && !isCancelled) {
-          setTimeout(connectSse, 5000);
+          setSseStatus("error");
+          reconnectTimer = setTimeout(connectSse, 5000);
         }
       }
     };
@@ -244,6 +281,7 @@ export const DashboardView: React.FC = () => {
 
     return () => {
       isCancelled = true;
+      if (reconnectTimer) clearTimeout(reconnectTimer);
       controller.abort();
     };
   }, [committedToken]);
@@ -259,6 +297,8 @@ export const DashboardView: React.FC = () => {
   };
 
   const handleStartSession = async (minutes: number) => {
+    if (isStartingSession) return;
+    setIsStartingSession(true);
     try {
       const res = await invoke<SessionState>("start_focus_session", {
         taskTitle: taskInput.trim() || "Deep Work Session",
@@ -271,6 +311,8 @@ export const DashboardView: React.FC = () => {
       console.error("Failed to start session:", err);
       setActionError(`Failed to start session: ${err}`);
       setTimeout(() => setActionError(null), 4000);
+    } finally {
+      setIsStartingSession(false);
     }
   };
 
@@ -465,8 +507,28 @@ export const DashboardView: React.FC = () => {
                   <Cloud className="w-3.5 h-3.5 text-blue-400" />
                   <span>Task Buddy API Sync</span>
                 </span>
-                <span className={`text-[10px] ${authToken ? "text-blue-400" : "text-emerald-400"}`}>
-                  {authToken ? "SSE Web Sync Active" : "Offline SQLite Active"}
+                <span
+                  className={`text-[10px] ${
+                    !committedToken
+                      ? "text-emerald-400"
+                      : sseStatus === "connected"
+                      ? "text-emerald-400"
+                      : sseStatus === "connecting"
+                      ? "text-amber-400"
+                      : sseStatus === "auth_error"
+                      ? "text-red-400"
+                      : "text-rose-400"
+                  }`}
+                >
+                  {!committedToken
+                    ? "Offline SQLite Active"
+                    : sseStatus === "connected"
+                    ? "SSE Web Sync Active"
+                    : sseStatus === "connecting"
+                    ? "Connecting SSE Sync..."
+                    : sseStatus === "auth_error"
+                    ? "Sync Auth Invalid (401)"
+                    : "Sync Disconnected"}
                 </span>
               </div>
               <input
@@ -525,18 +587,20 @@ export const DashboardView: React.FC = () => {
               {!session.is_focus_active ? (
                 <div className="grid grid-cols-2 gap-2.5">
                   <button
+                    disabled={isStartingSession}
                     onClick={() => handleStartSession(25)}
-                    className="flex items-center justify-center gap-2 px-3 py-2.5 bg-emerald-600 hover:bg-emerald-500 active:bg-emerald-700 text-white font-medium text-xs rounded-lg transition-colors shadow-sm cursor-pointer"
+                    className="flex items-center justify-center gap-2 px-3 py-2.5 bg-emerald-600 hover:bg-emerald-500 active:bg-emerald-700 disabled:opacity-50 disabled:cursor-not-allowed text-white font-medium text-xs rounded-lg transition-colors shadow-sm cursor-pointer"
                   >
                     <Play className="w-3.5 h-3.5" />
-                    <span>Start 25m Block</span>
+                    <span>{isStartingSession ? "Starting..." : "Start 25m Block"}</span>
                   </button>
                   <button
+                    disabled={isStartingSession}
                     onClick={() => handleStartSession(50)}
-                    className="flex items-center justify-center gap-2 px-3 py-2.5 bg-slate-800 hover:bg-slate-700 active:bg-slate-850 text-white font-medium text-xs rounded-lg transition-colors border border-slate-700/80 cursor-pointer"
+                    className="flex items-center justify-center gap-2 px-3 py-2.5 bg-slate-800 hover:bg-slate-700 active:bg-slate-850 disabled:opacity-50 disabled:cursor-not-allowed text-white font-medium text-xs rounded-lg transition-colors border border-slate-700/80 cursor-pointer"
                   >
                     <Play className="w-3.5 h-3.5" />
-                    <span>Start 50m Block</span>
+                    <span>{isStartingSession ? "Starting..." : "Start 50m Block"}</span>
                   </button>
                 </div>
               ) : (

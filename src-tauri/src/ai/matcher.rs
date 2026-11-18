@@ -90,6 +90,45 @@ impl ContentMatcher {
         result
     }
 
+    /// Evaluates alignment for native OS monitor loop without delaying polling intervals.
+    /// Checks cache first; if missing and Groq API is configured, kicks off background async
+    /// cache population while immediately returning offline heuristic fallback.
+    pub fn evaluate_monitor_alignment(&self, task_title: &str, media_title: &str) -> MatchResult {
+        let clean_task = task_title.trim();
+        let clean_media = media_title.trim();
+
+        if clean_task.is_empty() || clean_media.is_empty() {
+            return MatchResult {
+                aligned: true,
+                confidence: 1.0,
+                source: "empty_bypass".to_string(),
+            };
+        }
+
+        let cache_key = (clean_task.to_lowercase(), clean_media.to_lowercase());
+
+        // 1. Check in-memory cache
+        {
+            let cache = self.cache.lock().unwrap();
+            if let Some(cached) = cache.get(&cache_key) {
+                return cached.clone();
+            }
+        }
+
+        // 2. If Groq key is present, schedule background query to populate cache
+        if self.get_api_key().is_some() {
+            let matcher_clone = self.clone();
+            let task_s = clean_task.to_string();
+            let media_s = clean_media.to_string();
+            tauri::async_runtime::spawn(async move {
+                let _ = matcher_clone.is_aligned(&task_s, &media_s).await;
+            });
+        }
+
+        // 3. Fallback to immediate offline heuristic
+        self.evaluate_offline(clean_task, clean_media)
+    }
+
     /// Calls Groq API with gpt-oss-20b or llama-3.1-8b-instant
     async fn evaluate_with_groq(
         &self,
