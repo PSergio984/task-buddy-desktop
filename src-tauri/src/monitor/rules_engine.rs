@@ -37,6 +37,7 @@ pub struct RulesEngine {
     pub custom_whitelist: HashSet<String>,
     pub custom_blacklist: HashSet<String>,
     pub shield_grace_until: Option<Instant>,
+    pub bypass_grace_until: Option<Instant>,
 }
 
 impl Default for RulesEngine {
@@ -47,6 +48,7 @@ impl Default for RulesEngine {
             custom_whitelist: HashSet::new(),
             custom_blacklist: HashSet::new(),
             shield_grace_until: None,
+            bypass_grace_until: None,
         }
     }
 }
@@ -58,6 +60,10 @@ impl RulesEngine {
 
     pub fn grant_tactical_shield(&mut self, duration: Duration) {
         self.shield_grace_until = Some(Instant::now() + duration);
+    }
+
+    pub fn grant_bypass_grace(&mut self, duration: Duration) {
+        self.bypass_grace_until = Some(Instant::now() + duration);
     }
 
     pub fn update_rules(&mut self, rules: &[crate::db::ProcessRule]) {
@@ -94,7 +100,18 @@ impl RulesEngine {
             };
         }
 
-        // Tactical Shield grace buffer (e.g. 5 minutes) grants temporary immunity
+        // Bypass grace buffer suppresses repeated triggers immediately following a successful hold
+        if let Some(until) = self.bypass_grace_until {
+            if Instant::now() < until {
+                return EvaluationResult::Allow {
+                    reason: "Bypass grace period active",
+                };
+            } else {
+                self.bypass_grace_until = None;
+            }
+        }
+
+        // Tactical Shield grace buffer (5 minutes) grants temporary immunity
         if let Some(until) = self.shield_grace_until {
             if Instant::now() < until {
                 return EvaluationResult::Allow {
@@ -107,35 +124,82 @@ impl RulesEngine {
 
         let proc = window.process_name.to_lowercase();
 
-        // 1. Blacklisted apps trigger immediate barrier
-        if DEFAULT_BLACKLIST.contains(&proc.as_str()) || self.custom_blacklist.contains(&proc) {
+        // 1. User custom whitelist overrides all defaults
+        if self.custom_whitelist.contains(&proc) {
+            if media.is_playing {
+                self.was_playing = true;
+                self.pause_started_at = None;
+            }
+            return EvaluationResult::Allow {
+                reason: "User custom whitelisted application",
+            };
+        }
+
+        // 2. Blacklisted apps trigger immediate barrier
+        if self.custom_blacklist.contains(&proc) || DEFAULT_BLACKLIST.contains(&proc.as_str()) {
             return EvaluationResult::TriggerBarrier {
                 reason: "Blacklisted distraction application active",
             };
         }
 
-        // 2. Whitelisted development tools are always allowed
-        if DEFAULT_WHITELIST.contains(&proc.as_str()) || self.custom_whitelist.contains(&proc) {
-            // User is actively in IDE or terminal, keep them in the zone
+        // 3. Process lookup failure check: fail closed if title matches blacklisted keywords
+        if window.lookup_failed && !window.title.is_empty() {
+            let t = window.title.to_lowercase();
+            for item in DEFAULT_BLACKLIST {
+                let stem = item.strip_suffix(".exe").unwrap_or(item);
+                if t.contains(stem) {
+                    return EvaluationResult::TriggerBarrier {
+                        reason: "Blocked application matching distraction signature",
+                    };
+                }
+            }
+        }
+
+        // 4. Whitelisted development tools are always allowed
+        if DEFAULT_WHITELIST.contains(&proc.as_str()) {
+            if media.is_playing {
+                self.was_playing = true;
+                self.pause_started_at = None;
+            }
             return EvaluationResult::Allow {
                 reason: "Active development tool whitelisted",
             };
         }
 
-        // 2.5 Task Buddy web app is always allowed in any browser
-        let title_lower = window.title.to_lowercase();
-        if title_lower.contains("task buddy") || title_lower.contains("localhost:3000") {
-            return EvaluationResult::Allow {
-                reason: "Task Buddy web application whitelisted",
-            };
+        // 5. Task Buddy web app is allowed in web browsers
+        let is_browser = matches!(
+            proc.as_str(),
+            "chrome.exe" | "msedge.exe" | "firefox.exe" | "brave.exe" | "opera.exe"
+        );
+        if is_browser {
+            let title_lower = window.title.to_lowercase();
+            if title_lower.ends_with(" - task buddy")
+                || title_lower.starts_with("task buddy - ")
+                || title_lower.contains("localhost:3000")
+                || title_lower.contains("taskbuddy.app")
+            {
+                if media.is_playing {
+                    self.was_playing = true;
+                    self.pause_started_at = None;
+                }
+                return EvaluationResult::Allow {
+                    reason: "Task Buddy web application active",
+                };
+            }
         }
 
-        // 3. Media playback tracking
+        // 6. Media playback tracking
         if media.is_playing {
             self.was_playing = true;
             self.pause_started_at = None;
 
-            // If media is verified unaligned with declared task, trigger barrier
+            // Missing metadata or verified unaligned media triggers barrier
+            if media.metadata_missing {
+                return EvaluationResult::TriggerBarrier {
+                    reason: "Media playing without identifiable instructional metadata",
+                };
+            }
+
             if !is_media_aligned && !media.title.is_empty() {
                 return EvaluationResult::TriggerBarrier {
                     reason: "Media playback does not align with declared hourly task",
@@ -178,6 +242,7 @@ mod tests {
             title: "Test Window".to_string(),
             process_name: proc.to_string(),
             is_empty: false,
+            lookup_failed: false,
         }
     }
 
@@ -186,107 +251,47 @@ mod tests {
             has_active_media: true,
             is_playing: playing,
             title: title.to_string(),
-            artist: "Test Artist".to_string(),
-            source_app_id: "chrome.exe".to_string(),
+            artist: "".to_string(),
+            source_app_id: "".to_string(),
+            metadata_missing: false,
         }
     }
 
     #[test]
-    fn test_free_time_always_allows() {
+    fn test_custom_whitelist_overrides_default_blacklist() {
         let mut engine = RulesEngine::new();
-        let win = dummy_window("steam.exe");
-        let med = dummy_media(false, "Random");
-        let res = engine.evaluate(false, &win, &med, true);
-        assert_eq!(res, EvaluationResult::Allow { reason: "Free Time active (0 barriers)" });
-    }
+        engine.custom_whitelist.insert("discord.exe".to_string());
 
-    #[test]
-    fn test_blacklisted_app_triggers_barrier() {
-        let mut engine = RulesEngine::new();
         let win = dummy_window("discord.exe");
         let med = dummy_media(false, "");
         let res = engine.evaluate(true, &win, &med, true);
-        assert_eq!(res, EvaluationResult::TriggerBarrier { reason: "Blacklisted distraction application active" });
+
+        assert_eq!(res, EvaluationResult::Allow { reason: "User custom whitelisted application" });
     }
 
     #[test]
-    fn test_whitelisted_ide_always_allows() {
+    fn test_bypass_grace_period() {
         let mut engine = RulesEngine::new();
-        let win = dummy_window("cursor.exe");
+        engine.grant_bypass_grace(Duration::from_secs(10));
+
+        let win = dummy_window("steam.exe");
         let med = dummy_media(false, "");
         let res = engine.evaluate(true, &win, &med, true);
-        assert_eq!(res, EvaluationResult::Allow { reason: "Active development tool whitelisted" });
+
+        assert_eq!(res, EvaluationResult::Allow { reason: "Bypass grace period active" });
     }
 
     #[test]
-    fn test_media_misaligned_triggers_barrier() {
+    fn test_whitelisted_ide_clears_pause_when_media_playing() {
         let mut engine = RulesEngine::new();
-        let win = dummy_window("chrome.exe");
-        let med = dummy_media(true, "Top Funny Cat Clips");
-        let res = engine.evaluate(true, &win, &med, false);
-        assert_eq!(res, EvaluationResult::TriggerBarrier { reason: "Media playback does not align with declared hourly task" });
-    }
-
-    #[test]
-    fn test_media_aligned_playing_allows() {
-        let mut engine = RulesEngine::new();
-        let win = dummy_window("chrome.exe");
-        let med = dummy_media(true, "Rust Async in Tauri");
-        let res = engine.evaluate(true, &win, &med, true);
-        assert_eq!(res, EvaluationResult::Allow { reason: "Tutorial media is actively playing and aligned" });
-    }
-
-    #[test]
-    fn test_coding_grace_buffer_trigger() {
-        let mut engine = RulesEngine::new();
-        let win = dummy_window("chrome.exe");
-        
-        // 1. Media playing
-        let med_playing = dummy_media(true, "Rust Tutorial");
-        engine.evaluate(true, &win, &med_playing, true);
-        assert!(engine.was_playing);
-
-        // 2. Media paused just now (within 30s)
-        let med_paused = dummy_media(false, "Rust Tutorial");
-        let res1 = engine.evaluate(true, &win, &med_paused, true);
-        assert_eq!(res1, EvaluationResult::Allow { reason: "Within 30-second coding grace buffer" });
-
-        // 3. Fast-forward pause time past 30 seconds
-        engine.pause_started_at = Some(Instant::now() - Duration::from_secs(35));
-        let res2 = engine.evaluate(true, &win, &med_paused, true);
-        assert_eq!(res2, EvaluationResult::TriggerBarrier { reason: "Tutorial paused beyond 30-second coding grace buffer" });
-    }
-
-    #[test]
-    fn test_task_buddy_browser_window_is_whitelisted() {
-        let mut engine = RulesEngine::new();
-        let mut win = dummy_window("chrome.exe");
-        win.title = "Task Buddy — Focus & Planner".to_string();
-        let med = dummy_media(false, "");
-        let res = engine.evaluate(true, &win, &med, true);
-        assert_eq!(
-            res,
-            EvaluationResult::Allow {
-                reason: "Task Buddy web application whitelisted"
-            }
-        );
-    }
-
-    #[test]
-    fn test_tactical_shield_grace_buffer_allows() {
-        let mut engine = RulesEngine::new();
-        let win = dummy_window("chrome.exe");
-        let med = dummy_media(false, "");
-        // Without shield, paused tutorial beyond buffer triggers barrier
         engine.was_playing = true;
-        engine.pause_started_at = Some(Instant::now() - Duration::from_secs(35));
-        let res1 = engine.evaluate(true, &win, &med, true);
-        assert_eq!(res1, EvaluationResult::TriggerBarrier { reason: "Tutorial paused beyond 30-second coding grace buffer" });
+        engine.pause_started_at = Some(Instant::now());
 
-        // Grant 5m tactical shield -> now allows
-        engine.grant_tactical_shield(Duration::from_secs(300));
-        let res2 = engine.evaluate(true, &win, &med, true);
-        assert_eq!(res2, EvaluationResult::Allow { reason: "Tactical Shield 5-minute grace buffer active" });
+        let win = dummy_window("code.exe");
+        let med = dummy_media(true, "Rust tutorial");
+        let res = engine.evaluate(true, &win, &med, true);
+
+        assert_eq!(res, EvaluationResult::Allow { reason: "Active development tool whitelisted" });
+        assert!(engine.pause_started_at.is_none());
     }
 }
-

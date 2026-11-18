@@ -165,18 +165,20 @@ impl BackendSyncClient {
 
         if !res.status().is_success() {
             let status = res.status();
-            if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
-                return Err(format!("Backend auth expired or invalid: {}", status));
-            }
-            return Ok(None);
+            let text = res.text().await.unwrap_or_default();
+            return Err(format!("Backend error {}: {}", status, text));
         }
 
-        let text = res.text().await.unwrap_or_default();
+        let text = res
+            .text()
+            .await
+            .map_err(|e| format!("Failed to read stream response: {}", e))?;
+
         for line in text.lines() {
             if let Some(json_str) = line.strip_prefix("data:") {
-                if let Ok(state) = serde_json::from_str::<RemoteSessionState>(json_str.trim()) {
-                    return Ok(Some(state));
-                }
+                let state = serde_json::from_str::<RemoteSessionState>(json_str.trim())
+                    .map_err(|e| format!("Failed to parse SSE payload: {}", e))?;
+                return Ok(Some(state));
             }
         }
 

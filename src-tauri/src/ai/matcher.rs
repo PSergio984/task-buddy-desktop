@@ -1,18 +1,19 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MatchResult {
     pub aligned: bool,
     pub confidence: f32,
-    pub source: String, // "groq_api" | "offline_heuristic" | "cache"
+    pub source: String, // "groq_api" | "offline_heuristic" | "cache" | "empty_bypass"
 }
 
 #[derive(Clone)]
 pub struct ContentMatcher {
     api_key: Arc<Mutex<Option<String>>>,
-    cache: Arc<Mutex<HashMap<String, MatchResult>>>,
+    cache: Arc<Mutex<HashMap<(String, String), MatchResult>>>,
     client: reqwest::Client,
 }
 
@@ -21,7 +22,10 @@ impl Default for ContentMatcher {
         Self {
             api_key: Arc::new(Mutex::new(None)),
             cache: Arc::new(Mutex::new(HashMap::new())),
-            client: reqwest::Client::new(),
+            client: reqwest::Client::builder()
+                .timeout(Duration::from_secs(10))
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new()),
         }
     }
 }
@@ -34,6 +38,8 @@ impl ContentMatcher {
     pub fn set_api_key(&self, key: Option<String>) {
         let mut lock = self.api_key.lock().unwrap();
         *lock = key.filter(|k| !k.trim().is_empty());
+        let mut cache = self.cache.lock().unwrap();
+        cache.clear();
     }
 
     pub fn get_api_key(&self) -> Option<String> {
@@ -53,7 +59,7 @@ impl ContentMatcher {
             };
         }
 
-        let cache_key = format!("{}::{}", clean_task.to_lowercase(), clean_media.to_lowercase());
+        let cache_key = (clean_task.to_lowercase(), clean_media.to_lowercase());
 
         // 1. Check in-memory cache
         {
@@ -75,8 +81,8 @@ impl ContentMatcher {
             self.evaluate_offline(clean_task, clean_media)
         };
 
-        // Cache the result
-        {
+        // Cache successful Groq API evaluations
+        if result.source == "groq_api" {
             let mut cache = self.cache.lock().unwrap();
             cache.insert(cache_key, result.clone());
         }
@@ -91,12 +97,11 @@ impl ContentMatcher {
         task_title: &str,
         media_title: &str,
     ) -> Result<MatchResult, String> {
+        let task_json = serde_json::to_string(task_title).unwrap_or_else(|_| format!("{:?}", task_title));
+        let media_json = serde_json::to_string(media_title).unwrap_or_else(|_| format!("{:?}", media_title));
         let prompt = format!(
-            r#"Compare the declared task title and the active video/tutorial title. Is the video content relevant or aligned with working on the task?
-Task: "{}"
-Video: "{}"
-Respond ONLY in JSON format: {{"aligned": boolean, "confidence": float between 0.0 and 1.0}}"#,
-            task_title, media_title
+            "Compare the declared task title and the active video/tutorial title. Is the video content relevant or aligned with working on the task?\nTask: {}\nVideo: {}\nRespond ONLY in JSON format: {{\"aligned\": boolean, \"confidence\": float between 0.0 and 1.0}}",
+            task_json, media_json
         );
 
         let body = serde_json::json!({
@@ -170,8 +175,8 @@ Respond ONLY in JSON format: {{"aligned": boolean, "confidence": float between 0
 
         if task_tokens.is_empty() || media_tokens.is_empty() {
             return MatchResult {
-                aligned: true,
-                confidence: 0.5,
+                aligned: false,
+                confidence: 0.0,
                 source: "offline_heuristic".to_string(),
             };
         }
@@ -203,9 +208,23 @@ Respond ONLY in JSON format: {{"aligned": boolean, "confidence": float between 0
         .into_iter()
         .collect();
 
-        text.split(|c: char| !c.is_alphanumeric())
+        let short_tech_tokens: HashSet<&'static str> = [
+            "c", "r", "go", "c++", "c#", "ui", "ai", "db", "os", "ip", "js", "ts", "py", "rs",
+        ]
+        .into_iter()
+        .collect();
+
+        text.split(|c: char| !c.is_alphanumeric() && c != '+' && c != '#')
             .map(|s| s.trim().to_lowercase())
-            .filter(|s| s.len() >= 3 && !stop_words.contains(s.as_str()))
+            .filter(|s| {
+                if s.is_empty() {
+                    return false;
+                }
+                if short_tech_tokens.contains(s.as_str()) {
+                    return true;
+                }
+                s.len() >= 3 && !stop_words.contains(s.as_str())
+            })
             .collect()
     }
 }
@@ -232,6 +251,13 @@ mod tests {
     }
 
     #[test]
+    fn test_short_tech_tokens() {
+        let matcher = ContentMatcher::new();
+        let res = matcher.evaluate_offline("Learn C++ templates", "Advanced C++ tutorial");
+        assert!(res.aligned, "Expected 'c++' to match");
+    }
+
+    #[test]
     fn test_empty_titles_bypass() {
         let matcher = ContentMatcher::new();
         let res = tauri::async_runtime::block_on(matcher.is_aligned("", "Rust tutorial"));
@@ -242,13 +268,25 @@ mod tests {
     #[test]
     fn test_cache_hits() {
         let matcher = ContentMatcher::new();
-        let res1 = tauri::async_runtime::block_on(matcher.is_aligned("Write SQLite migrations", "SQLite migrations in Rust"));
-        assert!(res1.aligned);
+        let key = (
+            "write sqlite migrations".to_string(),
+            "sqlite migrations in rust".to_string(),
+        );
+        matcher.cache.lock().unwrap().insert(
+            key,
+            MatchResult {
+                aligned: true,
+                confidence: 0.99,
+                source: "groq_api".to_string(),
+            },
+        );
 
-        // Second call should return identical cached result
-        let res2 = tauri::async_runtime::block_on(matcher.is_aligned("Write SQLite migrations", "SQLite migrations in Rust"));
-        assert!(res2.aligned);
-        assert_eq!(res1.confidence, res2.confidence);
+        let res = tauri::async_runtime::block_on(
+            matcher.is_aligned("Write SQLite migrations", "SQLite migrations in Rust"),
+        );
+        assert!(res.aligned);
+        assert_eq!(res.source, "groq_api");
+        assert_eq!(res.confidence, 0.99);
+        assert_eq!(matcher.cache.lock().unwrap().len(), 1);
     }
 }
-

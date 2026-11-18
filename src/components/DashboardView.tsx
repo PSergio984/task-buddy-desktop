@@ -42,6 +42,8 @@ export const DashboardView: React.FC = () => {
   });
   const [taskInput, setTaskInput] = useState("");
   const [authToken, setAuthToken] = useState(() => localStorage.getItem("backend_auth_token") || "");
+  const [committedToken, setCommittedToken] = useState(() => localStorage.getItem("backend_auth_token") || "");
+  const [actionError, setActionError] = useState<string | null>(null);
   const [groqApiKey, setGroqApiKey] = useState(() => localStorage.getItem("groq_api_key") || "");
   const [rules, setRules] = useState<ProcessRule[]>([]);
   const [newProcessName, setNewProcessName] = useState("");
@@ -86,16 +88,22 @@ export const DashboardView: React.FC = () => {
   };
 
   const syncRemote = async () => {
-    if (!authToken.trim()) return;
+    if (!committedToken.trim()) return;
     try {
-      await invoke("sync_remote_session", { token: authToken.trim() });
+      const res = await invoke<any>("sync_remote_session", { token: committedToken.trim() });
+      if (res?.current_phase?.minutes) {
+        setSession((prev) => ({
+          ...prev,
+          duration_minutes: res.current_phase.minutes,
+        }));
+      }
     } catch {
       // Best-effort remote sync
     }
   };
 
-  const authTokenRef = useRef(authToken);
-  authTokenRef.current = authToken;
+  const authTokenRef = useRef(committedToken);
+  authTokenRef.current = committedToken;
   const hudPinnedRef = useRef(hudPinned);
   hudPinnedRef.current = hudPinned;
 
@@ -112,7 +120,12 @@ export const DashboardView: React.FC = () => {
 
   const handleAuthTokenChange = (token: string) => {
     setAuthToken(token);
-    localStorage.setItem("backend_auth_token", token);
+  };
+
+  const handleAuthTokenCommit = () => {
+    const trimmed = authToken.trim();
+    localStorage.setItem("backend_auth_token", trimmed);
+    setCommittedToken(trimmed);
   };
 
   // Static event listeners setup (runs once on mount)
@@ -166,7 +179,7 @@ export const DashboardView: React.FC = () => {
 
   // Persistent Server-Sent Events (SSE) Push Synchronization Stream
   useEffect(() => {
-    if (!authToken || !authToken.trim()) return;
+    if (!committedToken || !committedToken.trim()) return;
 
     syncRemote();
     const controller = new AbortController();
@@ -176,12 +189,13 @@ export const DashboardView: React.FC = () => {
       try {
         const response = await fetch("http://localhost:8000/api/v1/game/sessions/stream", {
           headers: {
-            Authorization: `Bearer ${authToken.trim()}`,
+            Authorization: `Bearer ${committedToken.trim()}`,
           },
           signal: controller.signal,
         });
 
         if (!response.ok || !response.body) {
+          if (!isCancelled) setTimeout(connectSse, 5000);
           return;
         }
 
@@ -200,13 +214,24 @@ export const DashboardView: React.FC = () => {
             for (const line of chunk.split("\n")) {
               if (line.startsWith("data:")) {
                 try {
-                  await invoke("sync_remote_session", { token: authToken.trim() });
+                  const stateUpdate = await invoke<any>("sync_remote_session", {
+                    token: committedToken.trim(),
+                  });
+                  if (stateUpdate?.current_phase?.minutes) {
+                    setSession((prev) => ({
+                      ...prev,
+                      duration_minutes: stateUpdate.current_phase.minutes,
+                    }));
+                  }
                 } catch {
                   // Silent decode parse
                 }
               }
             }
           }
+        }
+        if (!isCancelled) {
+          setTimeout(connectSse, 3000);
         }
       } catch (err: any) {
         if (err.name !== "AbortError" && !isCancelled) {
@@ -221,7 +246,7 @@ export const DashboardView: React.FC = () => {
       isCancelled = true;
       controller.abort();
     };
-  }, [authToken]);
+  }, [committedToken]);
 
   const handleGroqKeyChange = async (key: string) => {
     setGroqApiKey(key);
@@ -238,11 +263,14 @@ export const DashboardView: React.FC = () => {
       const res = await invoke<SessionState>("start_focus_session", {
         taskTitle: taskInput.trim() || "Deep Work Session",
         durationMinutes: minutes,
-        token: authToken.trim() || null,
+        token: committedToken.trim() || null,
       });
       setSession(res);
-    } catch (err) {
+      setActionError(null);
+    } catch (err: any) {
       console.error("Failed to start session:", err);
+      setActionError(`Failed to start session: ${err}`);
+      setTimeout(() => setActionError(null), 4000);
     }
   };
 
@@ -250,8 +278,11 @@ export const DashboardView: React.FC = () => {
     try {
       const res = await invoke<SessionState>("end_focus_session");
       setSession(res);
-    } catch (err) {
+      setActionError(null);
+    } catch (err: any) {
       console.error("Failed to end session:", err);
+      setActionError(`Failed to end session: ${err}`);
+      setTimeout(() => setActionError(null), 4000);
     }
   };
 
@@ -266,8 +297,11 @@ export const DashboardView: React.FC = () => {
       });
       setNewProcessName("");
       refreshRules();
-    } catch (err) {
+      setActionError(null);
+    } catch (err: any) {
       console.error("Failed to add rule:", err);
+      setActionError(`Failed to add rule: ${err}`);
+      setTimeout(() => setActionError(null), 4000);
     }
   };
 
@@ -275,8 +309,11 @@ export const DashboardView: React.FC = () => {
     try {
       await invoke("delete_local_rule", { id });
       refreshRules();
-    } catch (err) {
+      setActionError(null);
+    } catch (err: any) {
       console.error("Failed to delete rule:", err);
+      setActionError(`Failed to delete rule: ${err}`);
+      setTimeout(() => setActionError(null), 4000);
     }
   };
 
@@ -357,7 +394,10 @@ export const DashboardView: React.FC = () => {
               {displayRemaining}
             </span>
             <button
-              onClick={() => setHudPinned(!hudPinned)}
+              onClick={() => {
+                if (hudPinned) setShowHud(false);
+                setHudPinned(!hudPinned);
+              }}
               title={hudPinned ? "Unpin HUD" : "Pin HUD"}
               className={`p-1.5 rounded transition-colors cursor-pointer ${
                 hudPinned
@@ -434,6 +474,10 @@ export const DashboardView: React.FC = () => {
                 disabled={session.is_focus_active}
                 value={authToken}
                 onChange={(e) => handleAuthTokenChange(e.target.value)}
+                onBlur={handleAuthTokenCommit}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") handleAuthTokenCommit();
+                }}
                 placeholder="Paste Bearer Token to sync streaks (optional)"
                 className="w-full px-2.5 py-1.5 text-xs bg-slate-950 border border-slate-800 rounded text-slate-300 placeholder-slate-600 focus:outline-none focus:border-blue-500"
               />
@@ -458,6 +502,19 @@ export const DashboardView: React.FC = () => {
                 className="w-full px-2.5 py-1.5 text-xs bg-slate-950 border border-slate-800 rounded text-slate-300 placeholder-slate-600 focus:outline-none focus:border-purple-500"
               />
             </div>
+
+            {/* Error Notification */}
+            {actionError && (
+              <div className="p-3 rounded-xl bg-red-500/10 border border-red-500/20 text-red-400 text-xs flex items-center justify-between">
+                <span>{actionError}</span>
+                <button
+                  onClick={() => setActionError(null)}
+                  className="text-red-400 hover:text-red-200 text-xs px-1 cursor-pointer"
+                >
+                  ✕
+                </button>
+              </div>
+            )}
 
             {/* Session Controller */}
             <div className="p-4 rounded-xl bg-slate-900/60 border border-slate-800 space-y-3">
@@ -509,7 +566,7 @@ export const DashboardView: React.FC = () => {
             <div className="p-3.5 rounded-xl bg-slate-900/40 border border-slate-800/80 space-y-2">
               <span className="text-[10px] font-semibold text-slate-400 uppercase tracking-wider block flex items-center gap-1.5">
                 <Activity className="w-3 h-3 text-cyan-400" />
-                <span>Native Windows Telemetry (0.0% CPU)</span>
+                <span>Native Windows Telemetry</span>
               </span>
 
               <div className="space-y-1.5 text-xs">
@@ -606,8 +663,9 @@ export const DashboardView: React.FC = () => {
                       {rule.category}
                     </span>
                     <button
+                      aria-label={`Delete rule ${rule.process_name}`}
                       onClick={() => handleDeleteRule(rule.id)}
-                      className="text-slate-500 hover:text-red-400 transition-colors p-1"
+                      className="text-slate-500 hover:text-red-400 transition-colors p-1 cursor-pointer"
                     >
                       <Trash2 className="w-3.5 h-3.5" />
                     </button>

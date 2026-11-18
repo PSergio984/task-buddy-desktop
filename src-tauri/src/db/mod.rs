@@ -43,6 +43,7 @@ pub struct Database {
 impl Database {
     pub fn new<P: AsRef<Path>>(path: P) -> Result<Self> {
         let conn = Connection::open(path)?;
+        conn.execute_batch("PRAGMA foreign_keys = ON;")?;
         let db = Self {
             conn: Arc::new(Mutex::new(conn)),
         };
@@ -52,6 +53,7 @@ impl Database {
 
     pub fn new_in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory()?;
+        conn.execute_batch("PRAGMA foreign_keys = ON;")?;
         let db = Self {
             conn: Arc::new(Mutex::new(conn)),
         };
@@ -64,6 +66,13 @@ impl Database {
 
         conn.execute_batch(
             r#"
+            PRAGMA foreign_keys = ON;
+
+            CREATE TABLE IF NOT EXISTS schema_metadata (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            );
+
             CREATE TABLE IF NOT EXISTS local_rules (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 process_name TEXT NOT NULL UNIQUE,
@@ -92,20 +101,36 @@ impl Database {
                 detected_title TEXT,
                 bypassed BOOLEAN NOT NULL DEFAULT 0
             );
-
-            -- Default seed rules
-            INSERT OR IGNORE INTO local_rules (process_name, category) VALUES
-                ('code.exe', 'whitelist'),
-                ('cursor.exe', 'whitelist'),
-                ('windowsterminal.exe', 'whitelist'),
-                ('powershell.exe', 'whitelist'),
-                ('cmd.exe', 'whitelist'),
-                ('steam.exe', 'blacklist'),
-                ('discord.exe', 'blacklist'),
-                ('spotify.exe', 'blacklist'),
-                ('telegram.exe', 'blacklist');
             "#,
         )?;
+
+        // Only seed default rules once so user deletions are preserved
+        let already_seeded: bool = conn
+            .query_row(
+                "SELECT 1 FROM schema_metadata WHERE key = 'seeds_initialized'",
+                [],
+                |_| Ok(true),
+            )
+            .unwrap_or(false);
+
+        if !already_seeded {
+            conn.execute_batch(
+                r#"
+                INSERT OR IGNORE INTO local_rules (process_name, category) VALUES
+                    ('code.exe', 'whitelist'),
+                    ('cursor.exe', 'whitelist'),
+                    ('windowsterminal.exe', 'whitelist'),
+                    ('powershell.exe', 'whitelist'),
+                    ('cmd.exe', 'whitelist'),
+                    ('steam.exe', 'blacklist'),
+                    ('discord.exe', 'blacklist'),
+                    ('spotify.exe', 'blacklist'),
+                    ('telegram.exe', 'blacklist');
+
+                INSERT OR REPLACE INTO schema_metadata (key, value) VALUES ('seeds_initialized', '1');
+                "#,
+            )?;
+        }
 
         Ok(())
     }
@@ -142,7 +167,10 @@ impl Database {
 
     pub fn delete_rule(&self, id: i64) -> Result<()> {
         let conn = self.conn.lock().unwrap();
-        conn.execute("DELETE FROM local_rules WHERE id = ?1", params![id])?;
+        let affected = conn.execute("DELETE FROM local_rules WHERE id = ?1", params![id])?;
+        if affected == 0 {
+            return Err(rusqlite::Error::QueryReturnedNoRows);
+        }
         Ok(())
     }
 
@@ -177,12 +205,15 @@ impl Database {
         diversion_count: u32,
     ) -> Result<()> {
         let conn = self.conn.lock().unwrap();
-        conn.execute(
+        let affected = conn.execute(
             r#"UPDATE focus_sessions 
                SET ended_at = ?2, actual_duration_seconds = ?3, status = ?4, diversion_count = ?5
                WHERE id = ?1"#,
             params![id, ended_at, actual_duration_seconds, status, diversion_count],
         )?;
+        if affected == 0 {
+            return Err(rusqlite::Error::QueryReturnedNoRows);
+        }
         Ok(())
     }
 
@@ -229,5 +260,33 @@ impl Database {
             ],
         )?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_schema_init_and_rules() {
+        let db = Database::new_in_memory().unwrap();
+        let rules = db.get_rules().unwrap();
+        assert!(!rules.is_empty(), "Expected seed rules");
+
+        db.add_rule("testapp.exe", "blacklist").unwrap();
+        let updated = db.get_rules().unwrap();
+        assert!(updated.iter().any(|r| r.process_name == "testapp.exe"));
+
+        let rule = updated.iter().find(|r| r.process_name == "testapp.exe").unwrap();
+        db.delete_rule(rule.id).unwrap();
+
+        // Deleting non-existent rule should return error
+        assert!(db.delete_rule(99999).is_err());
+    }
+
+    #[test]
+    fn test_update_session_end_affected_rows() {
+        let db = Database::new_in_memory().unwrap();
+        assert!(db.update_session_end("missing_id", "2026-01-01T00:00:00Z", 100, "completed", 0).is_err());
     }
 }

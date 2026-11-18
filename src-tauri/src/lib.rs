@@ -22,9 +22,13 @@ pub struct SessionState {
     pub duration_minutes: u32,
     pub elapsed_seconds: u32,
     pub is_overlay_visible: bool,
+    #[serde(skip_serializing)]
     pub backend_token: Option<String>,
     pub shield_spent: bool,
     pub tactical_shield_until: Option<i64>,
+    pub diversion_count: u32,
+    #[serde(skip)]
+    pub started_at_instant: Option<std::time::Instant>,
 }
 
 pub struct AppState {
@@ -36,15 +40,24 @@ pub struct AppState {
 
 #[tauri::command]
 fn get_session_status(state: State<'_, AppState>) -> SessionState {
-    state.session.lock().unwrap().clone()
+    let mut session = state.session.lock().unwrap();
+    if session.is_focus_active {
+        if let Some(instant) = session.started_at_instant {
+            session.elapsed_seconds = instant.elapsed().as_secs() as u32;
+        }
+    }
+    session.clone()
 }
 
 #[tauri::command]
-fn get_live_os_info() -> (monitor::ActiveWindowInfo, monitor::MediaStatus) {
-    (
-        monitor::get_active_window_info(),
-        monitor::get_current_media_status(),
-    )
+async fn get_live_os_info() -> Result<(monitor::ActiveWindowInfo, monitor::MediaStatus), String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        let win = monitor::get_active_window_info();
+        let med = monitor::get_current_media_status();
+        (win, med)
+    })
+    .await
+    .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -92,6 +105,117 @@ async fn check_content_alignment(
     Ok(state.matcher.is_aligned(&task_title, &media_title).await)
 }
 
+fn internal_start_session(
+    app: &AppHandle,
+    state: &AppState,
+    task_title: String,
+    duration_minutes: u32,
+    remote_id: Option<i64>,
+    token: Option<String>,
+) -> SessionState {
+    let mut session = state.session.lock().unwrap();
+
+    // If a session was already active, finalize its previous SQLite record
+    if session.is_focus_active && !session.session_id.is_empty() {
+        let ended_at = Utc::now().to_rfc3339();
+        let actual_sec = session.started_at_instant.map(|i| i.elapsed().as_secs() as u32).unwrap_or(0);
+        let _ = state.db.update_session_end(
+            &session.session_id,
+            &ended_at,
+            actual_sec,
+            "aborted",
+            session.diversion_count,
+        );
+        if let (Some(tok), Some(rid)) = (&session.backend_token, session.remote_session_id) {
+            let client = state.sync_client.clone();
+            let tok_clone = tok.clone();
+            tauri::async_runtime::spawn(async move {
+                let _ = client.stop_remote_session(&tok_clone, rid).await;
+            });
+        }
+    }
+
+    let session_uuid = format!("sess_{}", Utc::now().timestamp_millis());
+    let clean_title = if task_title.trim().is_empty() {
+        "Deep Work".to_string()
+    } else {
+        task_title.trim().to_string()
+    };
+
+    let record = db::FocusSessionRecord {
+        id: session_uuid.clone(),
+        task_id: None,
+        task_title: clean_title.clone(),
+        started_at: Utc::now().to_rfc3339(),
+        ended_at: None,
+        target_duration_minutes: duration_minutes,
+        actual_duration_seconds: 0,
+        status: "running".to_string(),
+        diversion_count: 0,
+        synced_to_backend: remote_id.is_some(),
+    };
+    let _ = state.db.insert_session(&record);
+
+    session.session_id = session_uuid;
+    session.remote_session_id = remote_id;
+    session.is_focus_active = true;
+    session.task_title = clean_title;
+    session.duration_minutes = duration_minutes;
+    session.elapsed_seconds = 0;
+    session.is_overlay_visible = false;
+    session.backend_token = token;
+    session.shield_spent = false;
+    session.tactical_shield_until = None;
+    session.diversion_count = 0;
+    session.started_at_instant = Some(std::time::Instant::now());
+
+    let snapshot = session.clone();
+    drop(session);
+
+    let _ = app.emit("session-changed", &snapshot);
+    snapshot
+}
+
+fn internal_end_session(app: &AppHandle, state: &AppState) -> SessionState {
+    let mut session = state.session.lock().unwrap();
+    session.is_focus_active = false;
+    session.is_overlay_visible = false;
+
+    let sess_id = session.session_id.clone();
+    let remote_id = session.remote_session_id;
+    let token = session.backend_token.clone();
+    let actual_sec = session.started_at_instant.map(|i| i.elapsed().as_secs() as u32).unwrap_or(session.elapsed_seconds);
+    let div_count = session.diversion_count;
+    session.started_at_instant = None;
+
+    if !sess_id.is_empty() {
+        let _ = state.db.update_session_end(
+            &sess_id,
+            &Utc::now().to_rfc3339(),
+            actual_sec,
+            "completed",
+            div_count,
+        );
+    }
+
+    if let (Some(t), Some(rid)) = (token, remote_id) {
+        let client = state.sync_client.clone();
+        tauri::async_runtime::spawn(async move {
+            let _ = client.stop_remote_session(&t, rid).await;
+        });
+    }
+
+    if let Some(overlay) = app.get_webview_window("overlay") {
+        let _ = overlay.hide();
+    }
+
+    let snapshot = session.clone();
+    drop(session);
+
+    let _ = app.emit("session-changed", &snapshot);
+    snapshot
+}
+
 #[tauri::command]
 async fn start_focus_session(
     app: AppHandle,
@@ -100,7 +224,6 @@ async fn start_focus_session(
     duration_minutes: u32,
     token: Option<String>,
 ) -> Result<SessionState, String> {
-    let session_uuid = format!("sess_{}", Utc::now().timestamp_millis());
     let clean_title = if task_title.trim().is_empty() {
         "Deep Work".to_string()
     } else {
@@ -121,71 +244,13 @@ async fn start_focus_session(
         }
     }
 
-    // Record in local SQLite
-    let record = db::FocusSessionRecord {
-        id: session_uuid.clone(),
-        task_id: None,
-        task_title: clean_title.clone(),
-        started_at: Utc::now().to_rfc3339(),
-        ended_at: None,
-        target_duration_minutes: duration_minutes,
-        actual_duration_seconds: 0,
-        status: "running".to_string(),
-        diversion_count: 0,
-        synced_to_backend: remote_id.is_some(),
-    };
-    let _ = state.db.insert_session(&record);
-
-    let mut session = state.session.lock().unwrap();
-    session.session_id = session_uuid;
-    session.remote_session_id = remote_id;
-    session.is_focus_active = true;
-    session.task_title = clean_title;
-    session.duration_minutes = duration_minutes;
-    session.elapsed_seconds = 0;
-    session.is_overlay_visible = false;
-    session.backend_token = token;
-
-    let snapshot = session.clone();
-    let _ = app.emit("session-changed", &snapshot);
+    let snapshot = internal_start_session(&app, &state, clean_title, duration_minutes, remote_id, token);
     Ok(snapshot)
 }
 
 #[tauri::command]
 async fn end_focus_session(app: AppHandle, state: State<'_, AppState>) -> Result<SessionState, String> {
-    let mut session = state.session.lock().unwrap();
-    session.is_focus_active = false;
-    session.is_overlay_visible = false;
-
-    let sess_id = session.session_id.clone();
-    let remote_id = session.remote_session_id;
-    let token = session.backend_token.clone();
-    let elapsed = session.elapsed_seconds;
-
-    // Update local SQLite record
-    let _ = state.db.update_session_end(
-        &sess_id,
-        &Utc::now().to_rfc3339(),
-        elapsed,
-        "completed",
-        0,
-    );
-
-    // Stop remote session if connected
-    if let (Some(t), Some(rid)) = (token, remote_id) {
-        let client = state.sync_client.clone();
-        tauri::async_runtime::spawn(async move {
-            let _ = client.stop_remote_session(&t, rid).await;
-        });
-    }
-
-    // Ensure overlay is hidden if active
-    if let Some(overlay) = app.get_webview_window("overlay") {
-        let _ = overlay.hide();
-    }
-
-    let snapshot = session.clone();
-    let _ = app.emit("session-changed", &snapshot);
+    let snapshot = internal_end_session(&app, &state);
     Ok(snapshot)
 }
 
@@ -208,6 +273,7 @@ fn trigger_barrier(app: AppHandle, state: State<'_, AppState>) -> Result<(), Str
 fn dismiss_barrier(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
     let mut session = state.session.lock().unwrap();
     session.is_overlay_visible = false;
+    session.diversion_count += 1;
 
     let sess_id = session.session_id.clone();
 
@@ -241,6 +307,7 @@ async fn record_barrier_bypass(
     let (sess_id, remote_id, auth_token) = {
         let mut session = state.session.lock().unwrap();
         session.is_overlay_visible = false;
+        session.diversion_count += 1;
         (
             session.session_id.clone(),
             session.remote_session_id,
@@ -288,6 +355,10 @@ fn dismiss_overlay_window(app: AppHandle) -> Result<(), String> {
 #[tauri::command]
 fn activate_tactical_shield(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
     let mut session = state.session.lock().unwrap();
+    if session.shield_spent {
+        return Err("Tactical shield already expended for this session".to_string());
+    }
+
     let until = Utc::now().timestamp_millis() + 300_000;
     session.tactical_shield_until = Some(until);
     session.shield_spent = true;
@@ -327,6 +398,31 @@ async fn sync_remote_session(
                 let should_be_active = phase.kind == "focus" && phase.status == "active";
                 if session.is_focus_active != should_be_active {
                     session.is_focus_active = should_be_active;
+                    if should_be_active && session.session_id.is_empty() {
+                        let new_id = format!("sync_{}", Utc::now().timestamp_millis());
+                        session.session_id = new_id.clone();
+                        session.started_at_instant = Some(std::time::Instant::now());
+                        session.shield_spent = false;
+                        session.tactical_shield_until = None;
+                        session.diversion_count = 0;
+                        let record = db::FocusSessionRecord {
+                            id: new_id,
+                            task_id: remote.task_id,
+                            task_title: remote.activity_label.clone().unwrap_or_else(|| "Remote Pomodoro".to_string()),
+                            started_at: Utc::now().to_rfc3339(),
+                            ended_at: None,
+                            target_duration_minutes: phase.minutes,
+                            actual_duration_seconds: 0,
+                            status: "running".to_string(),
+                            diversion_count: 0,
+                            synced_to_backend: true,
+                        };
+                        let _ = state.db.insert_session(&record);
+                    }
+                    changed = true;
+                }
+                if session.duration_minutes != phase.minutes && phase.minutes > 0 {
+                    session.duration_minutes = phase.minutes;
                     changed = true;
                 }
             }
@@ -344,10 +440,18 @@ async fn sync_remote_session(
                 let snapshot = session.clone();
                 let _ = app.emit("session-changed", &snapshot);
             }
-        } else if session.is_focus_active {
-            // Remote session ended -> drop to Free Time
+        } else if session.is_focus_active && session.remote_session_id.is_some() {
+            // Synchronized remote session ended -> finalize local row and drop to Free Time
             session.is_focus_active = false;
             session.is_overlay_visible = false;
+            let sess_id = session.session_id.clone();
+            let ended_at = Utc::now().to_rfc3339();
+            let actual_sec = session.started_at_instant.map(|i| i.elapsed().as_secs() as u32).unwrap_or(0);
+            let div_count = session.diversion_count;
+            session.started_at_instant = None;
+            session.remote_session_id = None;
+            let _ = state.db.update_session_end(&sess_id, &ended_at, actual_sec, "completed", div_count);
+
             if let Some(overlay) = app.get_webview_window("overlay") {
                 let _ = overlay.hide();
             }
@@ -370,20 +474,6 @@ fn toggle_task_hud(app: AppHandle) -> Result<(), String> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let db_instance = db::Database::new("task_buddy_desktop.db").expect("Failed to initialize SQLite database");
-    let sync_client = sync::BackendSyncClient::default();
-    let matcher = ai::ContentMatcher::new();
-
-    let app_state = AppState {
-        session: Arc::new(Mutex::new(SessionState::default())),
-        db: db_instance.clone(),
-        sync_client,
-        matcher: matcher.clone(),
-    };
-
-    let session_ref = app_state.session.clone();
-    let db_ref = db_instance.clone();
-
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(
@@ -398,39 +488,48 @@ pub fn run() {
                 })
                 .build(),
         )
-        .manage(app_state)
-        .invoke_handler(tauri::generate_handler![
-            get_session_status,
-            get_live_os_info,
-            get_local_rules,
-            add_local_rule,
-            delete_local_rule,
-            get_recent_sessions,
-            set_groq_api_key,
-            check_content_alignment,
-            start_focus_session,
-            end_focus_session,
-            trigger_barrier,
-            dismiss_barrier,
-            record_barrier_bypass,
-            dismiss_overlay_window,
-            activate_tactical_shield,
-            sync_remote_session,
-            toggle_task_hud,
-        ])
-        .setup(move |app| {
+        .setup(|app| {
+            let app_data = app.path().app_data_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+            let _ = std::fs::create_dir_all(&app_data);
+            let db_path = app_data.join("task_buddy_desktop.db");
+
+            let db_instance = db::Database::new(&db_path).expect("Failed to initialize SQLite database");
+            let sync_client = sync::BackendSyncClient::default();
+            let matcher = ai::ContentMatcher::new();
+
+            let app_state = AppState {
+                session: Arc::new(Mutex::new(SessionState::default())),
+                db: db_instance.clone(),
+                sync_client,
+                matcher: matcher.clone(),
+            };
+
+            let session_ref = app_state.session.clone();
+            let db_ref = db_instance.clone();
+            let matcher_ref = matcher.clone();
+
+            app.manage(app_state);
+
             // Register global hotkey Ctrl+Alt+Space for instant task glance HUD
             if let Ok(shortcut) = "ctrl+alt+space".parse::<Shortcut>() {
-                let _ = app.global_shortcut().register(shortcut);
+                if let Err(e) = app.global_shortcut().register(shortcut) {
+                    eprintln!("[shortcut] Failed to register Ctrl+Alt+Space: {e:?}");
+                }
             }
 
             // Spawn Background OS Monitor Thread with dynamic SQLite rules and AI matcher
             let monitor_handle = app.handle().clone();
             let monitor_session = session_ref.clone();
             let monitor_db = db_ref.clone();
-            let monitor_matcher = matcher.clone();
+            let monitor_matcher = matcher_ref.clone();
 
             std::thread::spawn(move || {
+                unsafe {
+                    let _ = windows::Win32::System::WinRT::RoInitialize(
+                        windows::Win32::System::WinRT::RO_INIT_MULTITHREADED,
+                    );
+                }
+
                 let mut rules = monitor::RulesEngine::new();
                 let mut last_rules_update = std::time::Instant::now();
 
@@ -465,9 +564,12 @@ pub fn run() {
                     let window = monitor::get_active_window_info();
                     let media = monitor::get_current_media_status();
 
-                    // Evaluate content alignment if media is active
+                    // Evaluate content alignment using full matcher (cache + groq + heuristic)
                     let is_media_aligned = if media.has_active_media && !media.title.is_empty() && is_focus_active {
-                        monitor_matcher.evaluate_offline(&active_task_title, &media.title).aligned
+                        tauri::async_runtime::block_on(
+                            monitor_matcher.is_aligned(&active_task_title, &media.title),
+                        )
+                        .aligned
                     } else {
                         true
                     };
@@ -563,39 +665,15 @@ pub fn run() {
                 .on_menu_event(|app, event| match event.id.as_ref() {
                     "start_25" => {
                         let state = app.state::<AppState>();
-                        let mut session = state.session.lock().unwrap();
-                        session.session_id = format!("sess_{}", Utc::now().timestamp_millis());
-                        session.is_focus_active = true;
-                        session.duration_minutes = 25;
-                        session.elapsed_seconds = 0;
-                        session.task_title = "Focus Session (25m)".to_string();
-                        let snapshot = session.clone();
-                        drop(session);
-                        let _ = app.emit("session-changed", &snapshot);
+                        let _ = internal_start_session(app, &state, "Focus Session (25m)".to_string(), 25, None, None);
                     }
                     "start_50" => {
                         let state = app.state::<AppState>();
-                        let mut session = state.session.lock().unwrap();
-                        session.session_id = format!("sess_{}", Utc::now().timestamp_millis());
-                        session.is_focus_active = true;
-                        session.duration_minutes = 50;
-                        session.elapsed_seconds = 0;
-                        session.task_title = "Deep Focus (50m)".to_string();
-                        let snapshot = session.clone();
-                        drop(session);
-                        let _ = app.emit("session-changed", &snapshot);
+                        let _ = internal_start_session(app, &state, "Deep Focus (50m)".to_string(), 50, None, None);
                     }
                     "end_session" => {
                         let state = app.state::<AppState>();
-                        let mut session = state.session.lock().unwrap();
-                        session.is_focus_active = false;
-                        session.is_overlay_visible = false;
-                        let snapshot = session.clone();
-                        drop(session);
-                        if let Some(overlay) = app.get_webview_window("overlay") {
-                            let _ = overlay.hide();
-                        }
-                        let _ = app.emit("session-changed", &snapshot);
+                        let _ = internal_end_session(app, &state);
                     }
                     "toggle_overlay" => {
                         if let Some(overlay) = app.get_webview_window("overlay") {
@@ -636,6 +714,25 @@ pub fn run() {
 
             Ok(())
         })
+        .invoke_handler(tauri::generate_handler![
+            get_session_status,
+            get_live_os_info,
+            get_local_rules,
+            add_local_rule,
+            delete_local_rule,
+            get_recent_sessions,
+            set_groq_api_key,
+            check_content_alignment,
+            start_focus_session,
+            end_focus_session,
+            trigger_barrier,
+            dismiss_barrier,
+            record_barrier_bypass,
+            dismiss_overlay_window,
+            activate_tactical_shield,
+            sync_remote_session,
+            toggle_task_hud,
+        ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

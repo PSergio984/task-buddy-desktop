@@ -1,6 +1,7 @@
 import { useEffect, useState, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { ShieldAlert, Clock, ArrowRight, ShieldCheck, Flame } from "lucide-react";
+import { listen } from "@tauri-apps/api/event";
+import { ShieldAlert, ArrowRight, ShieldCheck, Flame } from "lucide-react";
 
 const REQUIRED_HOLD_MS = 6000;
 
@@ -22,15 +23,39 @@ export const OverlayBarrierView: React.FC = () => {
   const animFrameRef = useRef<number | null>(null);
 
   useEffect(() => {
-    invoke<{ shield_spent: boolean }>("get_session_status")
-      .then((sess) => {
-        setShieldAvailable(!sess.shield_spent);
-      })
-      .catch(console.error);
+    const checkStatus = () => {
+      invoke<{ shield_spent: boolean }>("get_session_status")
+        .then((sess) => {
+          setShieldAvailable(!sess.shield_spent);
+        })
+        .catch(console.error);
+    };
+    checkStatus();
+
+    const unlistenPromise = listen("session-changed", () => {
+      checkStatus();
+    });
+
+    return () => {
+      unlistenPromise.then((unlisten) => unlisten());
+    };
   }, []);
 
   useEffect(() => {
+    const isControlElement = (el: HTMLElement | null) => {
+      if (!el) return false;
+      return (
+        el.tagName === "BUTTON" ||
+        el.tagName === "INPUT" ||
+        el.tagName === "TEXTAREA" ||
+        el.isContentEditable
+      );
+    };
+
     const handleKeyDown = (e: KeyboardEvent) => {
+      if (isControlElement(e.target as HTMLElement | null)) {
+        return;
+      }
       if (e.code === "Space" && !e.repeat && !isHolding) {
         e.preventDefault();
         startHold();
@@ -38,6 +63,9 @@ export const OverlayBarrierView: React.FC = () => {
     };
 
     const handleKeyUp = (e: KeyboardEvent) => {
+      if (isControlElement(e.target as HTMLElement | null)) {
+        return;
+      }
       if (e.code === "Space") {
         e.preventDefault();
         cancelHold();
@@ -49,9 +77,15 @@ export const OverlayBarrierView: React.FC = () => {
     return () => {
       window.removeEventListener("keydown", handleKeyDown);
       window.removeEventListener("keyup", handleKeyUp);
-      if (animFrameRef.current) cancelAnimationFrame(animFrameRef.current);
     };
   }, [isHolding]);
+
+  // Cancel any running animation frame only on unmount
+  useEffect(() => {
+    return () => {
+      if (animFrameRef.current) cancelAnimationFrame(animFrameRef.current);
+    };
+  }, []);
 
   const startHold = () => {
     setIsHolding(true);
@@ -92,30 +126,24 @@ export const OverlayBarrierView: React.FC = () => {
         );
         setTimeout(async () => {
           await invoke("dismiss_overlay_window");
-          await invoke("dismiss_barrier");
         }, 1200);
       } else {
         await invoke("dismiss_overlay_window");
-        await invoke("dismiss_barrier");
       }
     } catch (err) {
       console.error("Failed to record bypass penalty:", err);
-      await invoke("dismiss_overlay_window");
-      await invoke("dismiss_barrier");
+      setPenaltyFeedback("Failed to record bypass penalty. Barrier remains locked.");
     }
   };
 
   const activate5mAllowance = async () => {
+    if (!shieldAvailable) return;
     try {
-      if (shieldAvailable) {
-        await invoke("activate_tactical_shield");
-        setShieldAvailable(false);
-      } else {
-        await invoke("dismiss_barrier");
-      }
+      await invoke("activate_tactical_shield");
+      setShieldAvailable(false);
+      await invoke("dismiss_overlay_window");
     } catch (err) {
       console.error("Failed to activate tactical shield:", err);
-      await invoke("dismiss_barrier");
     }
   };
 
@@ -200,34 +228,26 @@ export const OverlayBarrierView: React.FC = () => {
         <div className="w-full pt-6 border-t border-slate-800/80 flex items-center justify-between gap-4">
           <div className="text-left">
             <div className="text-xs font-semibold text-slate-300 flex items-center gap-1.5">
-              {shieldAvailable ? (
-                <>
-                  <ShieldCheck className="w-3.5 h-3.5 text-emerald-400" />
-                  <span>1x Tactical Shield (0 HP Loss)</span>
-                </>
-              ) : (
-                <>
-                  <Clock className="w-3.5 h-3.5 text-blue-400" />
-                  <span>5-Minute Quick Allowance</span>
-                </>
-              )}
+              <ShieldCheck className={`w-3.5 h-3.5 ${shieldAvailable ? "text-emerald-400" : "text-slate-500"}`} />
+              <span>{shieldAvailable ? "1x Tactical Shield (5m Grace, 0 HP Loss)" : "Tactical Shield Expended"}</span>
             </div>
             <div className="text-[11px] text-slate-500">
               {shieldAvailable
-                ? "Emergency allowance to reply to a message"
+                ? "Emergency 5-minute allowance to reply to a critical message"
                 : "Shield already spent for this session"}
             </div>
           </div>
           <button
             onClick={activate5mAllowance}
-            className={`px-3 py-1.5 text-xs font-medium rounded-lg transition-colors flex items-center gap-1 cursor-pointer ${
+            disabled={!shieldAvailable}
+            className={`px-3 py-1.5 text-xs font-medium rounded-lg transition-colors flex items-center gap-1 ${
               shieldAvailable
-                ? "bg-emerald-500/10 hover:bg-emerald-500/20 text-emerald-400 border border-emerald-500/30"
-                : "bg-blue-500/10 hover:bg-blue-500/20 text-blue-400 border border-blue-500/30"
+                ? "bg-emerald-500/10 hover:bg-emerald-500/20 text-emerald-400 border border-emerald-500/30 cursor-pointer"
+                : "bg-slate-800 text-slate-500 border border-slate-700 cursor-not-allowed opacity-60"
             }`}
           >
-            <span>{shieldAvailable ? "Use Shield" : "Activate 5m"}</span>
-            <ArrowRight className="w-3 h-3" />
+            <span>{shieldAvailable ? "Use Shield" : "Shield Expended"}</span>
+            {shieldAvailable && <ArrowRight className="w-3 h-3" />}
           </button>
         </div>
       </div>
