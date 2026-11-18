@@ -48,7 +48,7 @@ jobs:
             cargo = cargo.replace(/^version = \".*\"/m, 'version = \"' + '$VERSION' + '\"');
             fs.writeFileSync(cargoPath, cargo);
           "
-          cargo check --manifest-path src-tauri/Cargo.toml
+          cargo update --workspace --manifest-path src-tauri/Cargo.toml
 
       - name: Frontend Typecheck & Build
         run: npm run build
