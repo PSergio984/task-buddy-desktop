@@ -366,14 +366,19 @@ async fn record_barrier_bypass(
     token: Option<String>,
     reason: Option<String>,
 ) -> Result<Option<sync::DiversionPenaltyResult>, String> {
-    let (sess_id, remote_id, auth_token) = {
+    let (sess_id, remote_id, auth_token, is_active) = {
         let session = state.session.lock().unwrap();
         (
             session.session_id.clone(),
             session.remote_session_id,
             token.or_else(|| session.backend_token.clone()),
+            session.is_focus_active,
         )
     };
+
+    if !is_active || sess_id.is_empty() {
+        return Ok(None);
+    }
 
     let trigger_reason = reason.unwrap_or_else(|| "manual_bypass".to_string());
     let mut penalty_res = None;
