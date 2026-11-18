@@ -50,6 +50,8 @@ export const OverlayBarrierView: React.FC<OverlayBarrierViewProps> = ({ isSecond
   const isHoldingRef = useRef(false);
 
   useEffect(() => {
+    if (isSecondary) return;
+
     const isControlElement = (el: HTMLElement | null) => {
       if (!el) return false;
       return (
@@ -86,7 +88,7 @@ export const OverlayBarrierView: React.FC<OverlayBarrierViewProps> = ({ isSecond
       window.removeEventListener("keydown", handleKeyDown);
       window.removeEventListener("keyup", handleKeyUp);
     };
-  }, []);
+  }, [isSecondary]);
 
   // Cancel any running animation frame only on unmount
   useEffect(() => {

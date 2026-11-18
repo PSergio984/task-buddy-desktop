@@ -31,6 +31,33 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Synchronize version from Git tag
+        shell: bash
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          echo "Syncing desktop release version to $VERSION"
+          npm version "$VERSION" --no-git-tag-version --allow-same-version
+          node -e "
+            const fs = require('fs');
+            const confPath = 'src-tauri/tauri.conf.json';
+            const conf = JSON.parse(fs.readFileSync(confPath, 'utf8'));
+            conf.version = '$VERSION';
+            fs.writeFileSync(confPath, JSON.stringify(conf, null, 2) + '\n');
+            const cargoPath = 'src-tauri/Cargo.toml';
+            let cargo = fs.readFileSync(cargoPath, 'utf8');
+            cargo = cargo.replace(/^version = \".*\"/m, 'version = \"' + '$VERSION' + '\"');
+            fs.writeFileSync(cargoPath, cargo);
+          "
+
+      - name: Frontend Typecheck & Build
+        run: npm run build
+
+      - name: Run Rust Tests
+        run: cargo test --manifest-path src-tauri/Cargo.toml --verbose
+
+      - name: Run Cargo Clippy
+        run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
+
       - name: Build Tauri Desktop Installer
         run: npm run tauri -- build --ci
 

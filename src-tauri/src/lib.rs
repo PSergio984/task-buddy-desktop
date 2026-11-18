@@ -678,19 +678,35 @@ pub fn run() {
             }
 
             // Spawn secondary overlays for additional connected monitors
+            // Note: Secondary overlays are enumerated for displays connected at launch. Displays connected after launch require an app restart to provision.
+            let primary_pos = app.primary_monitor().ok().flatten().map(|m| *m.position());
             if let Ok(monitors) = app.available_monitors() {
-                for (idx, monitor) in monitors.iter().enumerate().skip(1) {
-                    let label = format!("overlay_{}", idx);
-                    let _ = WebviewWindowBuilder::new(app, &label, WebviewUrl::App("index.html".into()))
-                        .title(format!("Task Buddy Barrier - Monitor {}", idx + 1))
+                let mut secondary_idx = 1;
+                for monitor in monitors {
+                    if Some(*monitor.position()) == primary_pos {
+                        continue;
+                    }
+                    let label = format!("overlay_{}", secondary_idx);
+                    let title = format!("Task Buddy Barrier - Display {}", secondary_idx + 1);
+                    secondary_idx += 1;
+
+                    match WebviewWindowBuilder::new(app, &label, WebviewUrl::App("index.html".into()))
+                        .title(title)
                         .transparent(true)
                         .decorations(false)
                         .always_on_top(true)
                         .visible(false)
                         .skip_taskbar(true)
-                        .position(monitor.position().x as f64, monitor.position().y as f64)
-                        .fullscreen(true)
-                        .build();
+                        .build()
+                    {
+                        Ok(window) => {
+                            let _ = window.set_position(tauri::Position::Physical(*monitor.position()));
+                            let _ = window.set_fullscreen(true);
+                        }
+                        Err(e) => {
+                            eprintln!("[overlay] Failed to spawn secondary overlay on {label}: {e:?}");
+                        }
+                    }
                 }
             }
 
