@@ -18,11 +18,13 @@ use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState};
 
 fn show_all_overlays(app: &AppHandle) {
     if let Some(overlay) = app.get_webview_window("overlay") {
+        let _ = overlay.set_always_on_top(true);
         let _ = overlay.show();
         let _ = overlay.set_focus();
     }
     for (label, window) in app.webview_windows() {
         if label.starts_with("overlay_") {
+            let _ = window.set_always_on_top(true);
             let _ = window.show();
         }
     }
