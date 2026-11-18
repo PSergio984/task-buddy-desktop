@@ -376,30 +376,40 @@ async fn record_barrier_bypass(
     }
 
     // Only mutate session, log SQLite diversion, and grant grace after penalty call succeeds
+    // Recheck session ID to ensure the session hasn't changed or ended during the remote await
+    let mut session_changed = false;
+    let mut snapshot_opt = None;
     {
         let mut session = state.session.lock().unwrap();
-        session.is_overlay_visible = false;
-        session.diversion_count += 1;
+        if session.session_id == sess_id && session.is_focus_active {
+            session.is_overlay_visible = false;
+            session.diversion_count += 1;
+            session_changed = true;
+            snapshot_opt = Some(session.clone());
+        }
     }
 
-    let div_record = db::DiversionEventRecord {
-        id: format!("div_{}", Utc::now().timestamp_millis()),
-        session_id: sess_id,
-        timestamp: Utc::now().to_rfc3339(),
-        trigger_type: trigger_reason,
-        detected_title: None,
-        bypassed: true,
-    };
-    let _ = state.db.record_diversion(&div_record);
+    if session_changed {
+        let div_record = db::DiversionEventRecord {
+            id: format!("div_{}", Utc::now().timestamp_millis()),
+            session_id: sess_id,
+            timestamp: Utc::now().to_rfc3339(),
+            trigger_type: trigger_reason,
+            detected_title: None,
+            bypassed: true,
+        };
+        let _ = state.db.record_diversion(&div_record);
 
-    state
-        .rules
-        .lock()
-        .unwrap()
-        .grant_bypass_grace(Duration::from_secs(60));
+        state
+            .rules
+            .lock()
+            .unwrap()
+            .grant_bypass_grace(Duration::from_secs(60));
 
-    let snapshot = state.session.lock().unwrap().clone();
-    let _ = app.emit("session-changed", &snapshot);
+        if let Some(snapshot) = snapshot_opt {
+            let _ = app.emit("session-changed", &snapshot);
+        }
+    }
 
     Ok(penalty_res)
 }

@@ -341,7 +341,7 @@ mod tests {
         let mut engine = RulesEngine::new();
         let mut win = dummy_window("");
         win.lookup_failed = true;
-        win.title = "Upstreaming commit to repo".to_string();
+        win.title = "Steamworks update notes".to_string();
         let med = dummy_media(false, "");
         let res1 = engine.evaluate(true, &win, &med, true);
         assert_ne!(res1, EvaluationResult::TriggerBarrier { reason: "Blocked application matching distraction signature" });
