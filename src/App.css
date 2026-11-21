@@ -1,7 +1,9 @@
+@import url('https://fonts.googleapis.com/css2?family=Geist:wght@300;400;500;600;700&family=Geist+Mono:wght@400;500;600&display=swap');
 @import "tailwindcss";
+@import "./tokens.css";
 
 :root {
-  font-family: Inter, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+  font-family: var(--font-body);
   color-scheme: dark;
 }
 
@@ -9,7 +11,14 @@ body {
   margin: 0;
   padding: 0;
   background-color: transparent;
-  color: #f3f4f6;
+  color: var(--ink);
   overflow: hidden;
   user-select: none;
 }
+
+body:not([data-window^="overlay"]) {
+  background-color: var(--bg);
+  background-image: var(--halftone);
+  background-size: 16px 16px;
+}
+
