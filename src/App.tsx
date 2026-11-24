@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { DashboardView } from "./components/DashboardView";
 import { OverlayBarrierView } from "./components/OverlayBarrierView";
@@ -15,6 +15,10 @@ function getInitialWindowLabel(): string {
 
 export function App() {
   const [windowLabel] = useState<string>(getInitialWindowLabel);
+
+  useEffect(() => {
+    document.body.dataset.window = windowLabel;
+  }, [windowLabel]);
 
   if (windowLabel.startsWith("overlay")) {
     const isSecondary = windowLabel !== "overlay";

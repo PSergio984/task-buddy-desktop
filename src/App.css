@@ -1,7 +1,27 @@
+@import "@fontsource-variable/geist";
+@import "@fontsource-variable/geist-mono";
 @import "tailwindcss";
+@import "./tokens.css";
+
+@theme inline {
+  --color-canvas: var(--bg);
+  --color-bg: var(--bg);
+  --color-ink: var(--ink);
+  --color-gray-50: var(--gray-50);
+  --color-gray-100: var(--gray-100);
+  --color-gray-200: var(--gray-200);
+  --color-gray-300: var(--gray-300);
+  --color-gray-400: var(--gray-400);
+  --color-gray-500: var(--gray-500);
+  --color-coral: var(--coral-accent);
+  --color-coral-tint: var(--coral-tint);
+  --color-status-live: var(--status-live);
+  --color-stream-mobile: var(--stream-mobile);
+  --color-stream-tauri: var(--stream-tauri);
+}
 
 :root {
-  font-family: Inter, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+  font-family: var(--font-body);
   color-scheme: dark;
 }
 
@@ -9,7 +29,14 @@ body {
   margin: 0;
   padding: 0;
   background-color: transparent;
-  color: #f3f4f6;
+  color: var(--ink);
   overflow: hidden;
   user-select: none;
 }
+
+body:not([data-window^="overlay"]) {
+  background-color: var(--bg);
+  background-image: var(--halftone);
+  background-size: 16px 16px;
+}
+
