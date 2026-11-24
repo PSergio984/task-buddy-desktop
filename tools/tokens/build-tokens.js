@@ -1,6 +1,6 @@
-import fs from 'node:fs';
-import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -34,7 +34,7 @@ export function compileTokens(tokens) {
   --radius-pill: ${radii.pill};
 
   --card-shadow: ${shadows.cardDark};
-  --halftone: ${textures?.halftoneDark ?? 'radial-gradient(rgba(255, 255, 255, 0.08) 1px, transparent 1px)'};
+  --halftone: ${textures?.halftoneDark ?? "radial-gradient(rgba(255, 255, 255, 0.08) 1px, transparent 1px)"};
 }
 
 html.light, .light, body[data-theme="light"], [data-theme="light"] {
@@ -54,7 +54,7 @@ html.light, .light, body[data-theme="light"], [data-theme="light"] {
   --stream-tauri: ${colors.light.streamTauri};
 
   --card-shadow: ${shadows.cardLight};
-  --halftone: ${textures?.halftoneLight ?? 'radial-gradient(rgba(0, 0, 0, 0.06) 1px, transparent 1px)'};
+  --halftone: ${textures?.halftoneLight ?? "radial-gradient(rgba(0, 0, 0, 0.06) 1px, transparent 1px)"};
 }
 `;
 
@@ -120,29 +120,38 @@ export const Spacing = {
 }
 
 export function runBuild() {
-  const tokensPath = path.resolve(__dirname, 'tokens.json');
-  const tokens = JSON.parse(fs.readFileSync(tokensPath, 'utf8'));
+  const tokensPath = path.resolve(__dirname, "tokens.json");
+  const tokens = JSON.parse(fs.readFileSync(tokensPath, "utf8"));
   const { cssOutput, tsMobileOutput } = compileTokens(tokens);
 
-  const webDest = path.resolve(__dirname, '../../task-buddy-frontend/src/styles/tokens.css');
-  const desktopDest = path.resolve(__dirname, '../../task-buddy-desktop/src/tokens.css');
-  const mobileDest = path.resolve(__dirname, '../../task-buddy-mobile/src/constants/colors.ts');
+  const webDest = path.resolve(
+    __dirname,
+    "../../task-buddy-frontend/src/styles/tokens.css",
+  );
+  const desktopDest = path.resolve(
+    __dirname,
+    "../../task-buddy-desktop/src/tokens.css",
+  );
+  const mobileDest = path.resolve(
+    __dirname,
+    "../../task-buddy-mobile/src/constants/colors.ts",
+  );
 
   fs.mkdirSync(path.dirname(webDest), { recursive: true });
-  fs.writeFileSync(webDest, cssOutput, 'utf8');
+  fs.writeFileSync(webDest, cssOutput, "utf8");
   console.log(`✔ Generated Web tokens: ${webDest}`);
 
   fs.mkdirSync(path.dirname(desktopDest), { recursive: true });
-  fs.writeFileSync(desktopDest, cssOutput, 'utf8');
+  fs.writeFileSync(desktopDest, cssOutput, "utf8");
   console.log(`✔ Generated Desktop tokens: ${desktopDest}`);
 
   fs.mkdirSync(path.dirname(mobileDest), { recursive: true });
-  fs.writeFileSync(mobileDest, tsMobileOutput, 'utf8');
+  fs.writeFileSync(mobileDest, tsMobileOutput, "utf8");
   console.log(`✔ Generated Mobile tokens: ${mobileDest}`);
 }
 
 const currentFile = path.resolve(fileURLToPath(import.meta.url));
-const executedFile = process.argv[1] ? path.resolve(process.argv[1]) : '';
+const executedFile = process.argv[1] ? path.resolve(process.argv[1]) : "";
 
 if (executedFile === currentFile) {
   runBuild();
