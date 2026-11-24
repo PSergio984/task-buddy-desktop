@@ -28,6 +28,7 @@
 }
 
 html.light, .light, body[data-theme="light"], [data-theme="light"] {
+  color-scheme: light;
   --bg: #FFFFFF;
   --ink: #0A0A0A;
   --gray-50: #FAFAFA;
